@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package logical
 
 import (
@@ -8,9 +11,10 @@ import (
 	"strings"
 	"time"
 
-	sockaddr "github.com/hashicorp/go-sockaddr"
+	"github.com/hashicorp/go-sockaddr"
 )
 
+//go:generate enumer -type=TokenType -trimprefix=TokenType -transform=kebab
 type TokenType uint8
 
 const (
@@ -69,29 +73,16 @@ func (t *TokenType) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (t TokenType) String() string {
-	switch t {
-	case TokenTypeDefault:
-		return "default"
-	case TokenTypeService:
-		return "service"
-	case TokenTypeBatch:
-		return "batch"
-	case TokenTypeDefaultService:
-		return "default-service"
-	case TokenTypeDefaultBatch:
-		return "default-batch"
-	default:
-		panic("unreachable")
-	}
-}
-
 // TokenEntry is used to represent a given token
 type TokenEntry struct {
 	Type TokenType `json:"type" mapstructure:"type" structs:"type" sentinel:""`
 
 	// ID of this entry, generally a random UUID
 	ID string `json:"id" mapstructure:"id" structs:"id" sentinel:""`
+
+	// ExternalID is the ID of a newly created service
+	// token that will be returned to a user
+	ExternalID string `json:"-"`
 
 	// Accessor for this token, a random UUID
 	Accessor string `json:"accessor" mapstructure:"accessor" structs:"accessor" sentinel:""`

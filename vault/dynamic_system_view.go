@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package vault
 
 import (
@@ -13,7 +16,10 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/pluginutil"
 	"github.com/hashicorp/vault/sdk/helper/wrapping"
 	"github.com/hashicorp/vault/sdk/logical"
-	"github.com/hashicorp/vault/sdk/version"
+	"github.com/hashicorp/vault/sdk/rotation"
+	"github.com/hashicorp/vault/vault/plugincatalog"
+	"github.com/hashicorp/vault/version"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type ctxKeyForwardedRequestMountAccessor struct{}
@@ -23,113 +29,9 @@ func (c ctxKeyForwardedRequestMountAccessor) String() string {
 }
 
 type dynamicSystemView struct {
-	core       *Core
-	mountEntry *MountEntry
-}
-
-type extendedSystemView interface {
-	logical.SystemView
-	logical.ExtendedSystemView
-	// SudoPrivilege won't work over the plugin system so we keep it here
-	// instead of in sdk/logical to avoid exposing to plugins
-	SudoPrivilege(context.Context, string, string) bool
-}
-
-type extendedSystemViewImpl struct {
-	dynamicSystemView
-}
-
-func (e extendedSystemViewImpl) Auditor() logical.Auditor {
-	return genericAuditor{
-		mountType: e.mountEntry.Type,
-		namespace: e.mountEntry.Namespace(),
-		c:         e.core,
-	}
-}
-
-func (e extendedSystemViewImpl) ForwardGenericRequest(ctx context.Context, req *logical.Request) (*logical.Response, error) {
-	// Forward the request if allowed
-	if couldForward(e.core) {
-		ctx = namespace.ContextWithNamespace(ctx, e.mountEntry.Namespace())
-		ctx = logical.IndexStateContext(ctx, &logical.WALState{})
-		ctx = context.WithValue(ctx, ctxKeyForwardedRequestMountAccessor{}, e.mountEntry.Accessor)
-		return forward(ctx, e.core, req)
-	}
-
-	return nil, logical.ErrReadOnly
-}
-
-// SudoPrivilege returns true if given path has sudo privileges
-// for the given client token
-func (e extendedSystemViewImpl) SudoPrivilege(ctx context.Context, path string, token string) bool {
-	// Resolve the token policy
-	te, err := e.core.tokenStore.Lookup(ctx, token)
-	if err != nil {
-		e.core.logger.Error("failed to lookup sudo token", "error", err)
-		return false
-	}
-
-	// Ensure the token is valid
-	if te == nil {
-		e.core.logger.Error("entry not found for given token")
-		return false
-	}
-
-	policyNames := make(map[string][]string)
-	// Add token policies
-	policyNames[te.NamespaceID] = append(policyNames[te.NamespaceID], te.Policies...)
-
-	tokenNS, err := NamespaceByID(ctx, te.NamespaceID, e.core)
-	if err != nil {
-		e.core.logger.Error("failed to lookup token namespace", "error", err)
-		return false
-	}
-	if tokenNS == nil {
-		e.core.logger.Error("failed to lookup token namespace", "error", namespace.ErrNoNamespace)
-		return false
-	}
-
-	// Add identity policies from all the namespaces
-	entity, identityPolicies, err := e.core.fetchEntityAndDerivedPolicies(ctx, tokenNS, te.EntityID, te.NoIdentityPolicies)
-	if err != nil {
-		e.core.logger.Error("failed to fetch identity policies", "error", err)
-		return false
-	}
-	for nsID, nsPolicies := range identityPolicies {
-		policyNames[nsID] = append(policyNames[nsID], nsPolicies...)
-	}
-
-	tokenCtx := namespace.ContextWithNamespace(ctx, tokenNS)
-
-	// Add the inline policy if it's set
-	policies := make([]*Policy, 0)
-	if te.InlinePolicy != "" {
-		inlinePolicy, err := ParseACLPolicy(tokenNS, te.InlinePolicy)
-		if err != nil {
-			e.core.logger.Error("failed to parse the token's inline policy", "error", err)
-			return false
-		}
-		policies = append(policies, inlinePolicy)
-	}
-
-	// Construct the corresponding ACL object. Derive and use a new context that
-	// uses the req.ClientToken's namespace
-	acl, err := e.core.policyStore.ACL(tokenCtx, entity, policyNames, policies...)
-	if err != nil {
-		e.core.logger.Error("failed to retrieve ACL for token's policies", "token_policies", te.Policies, "error", err)
-		return false
-	}
-
-	// The operation type isn't important here as this is run from a path the
-	// user has already been given access to; we only care about whether they
-	// have sudo. Note that we use root context because the path that comes in
-	// must be fully-qualified already so we don't want AllowOperation to
-	// prepend a namespace prefix onto it.
-	req := new(logical.Request)
-	req.Operation = logical.ReadOperation
-	req.Path = path
-	authResults := acl.AllowOperation(namespace.RootContext(ctx), req, true)
-	return authResults.RootPrivs
+	core        *Core
+	mountEntry  *MountEntry
+	perfStandby bool
 }
 
 func (d dynamicSystemView) DefaultLeaseTTL() time.Duration {
@@ -178,7 +80,7 @@ func (d dynamicSystemView) LocalMount() bool {
 // in read mode.
 func (d dynamicSystemView) ReplicationState() consts.ReplicationState {
 	state := d.core.ReplicationState()
-	if d.core.perfStandby {
+	if d.perfStandby {
 		state |= consts.ReplicationPerformanceStandby
 	}
 	return state
@@ -215,24 +117,62 @@ func (d dynamicSystemView) ResponseWrapData(ctx context.Context, data map[string
 	return resp.WrapInfo, nil
 }
 
-// LookupPlugin looks for a plugin with the given name in the plugin catalog. It
-// returns a PluginRunner or an error if no plugin was found.
-func (d dynamicSystemView) LookupPlugin(ctx context.Context, name string, pluginType consts.PluginType) (*pluginutil.PluginRunner, error) {
+func (d dynamicSystemView) NewPluginClient(ctx context.Context, config pluginutil.PluginClientConfig) (pluginutil.PluginClient, error) {
 	if d.core == nil {
 		return nil, fmt.Errorf("system view core is nil")
 	}
 	if d.core.pluginCatalog == nil {
 		return nil, fmt.Errorf("system view core plugin catalog is nil")
 	}
-	r, err := d.core.pluginCatalog.Get(ctx, name, pluginType)
+
+	c, err := d.core.pluginCatalog.NewPluginClient(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// LookupPlugin looks for a plugin with the given name in the plugin catalog. It
+// returns a PluginRunner or an error if no plugin was found.
+func (d dynamicSystemView) LookupPlugin(ctx context.Context, name string, pluginType consts.PluginType) (*pluginutil.PluginRunner, error) {
+	return d.LookupPluginVersion(ctx, name, pluginType, "")
+}
+
+// LookupPluginVersion looks for a plugin with the given name and version in the plugin catalog. It
+// returns a PluginRunner or an error if no plugin was found.
+func (d dynamicSystemView) LookupPluginVersion(ctx context.Context, name string, pluginType consts.PluginType, version string) (*pluginutil.PluginRunner, error) {
+	if d.core == nil {
+		return nil, fmt.Errorf("system view core is nil")
+	}
+	if d.core.pluginCatalog == nil {
+		return nil, fmt.Errorf("system view core plugin catalog is nil")
+	}
+	r, err := d.core.pluginCatalog.Get(ctx, name, pluginType, version)
 	if err != nil {
 		return nil, err
 	}
 	if r == nil {
-		return nil, fmt.Errorf("%w: %s", ErrPluginNotFound, name)
+		errContext := name
+		if version != "" {
+			errContext += fmt.Sprintf(", version=%s", version)
+		}
+		return nil, fmt.Errorf("%w: %s", plugincatalog.ErrPluginNotFound, errContext)
 	}
 
 	return r, nil
+}
+
+// ListVersionedPlugins returns information about all plugins of a certain
+// typein the catalog, including any versioning information stored for them.
+func (d dynamicSystemView) ListVersionedPlugins(ctx context.Context, pluginType consts.PluginType) ([]pluginutil.VersionedPlugin, error) {
+	if d.core == nil {
+		return nil, fmt.Errorf("system view core is nil")
+	}
+	if d.core.pluginCatalog == nil {
+		return nil, fmt.Errorf("system view core plugin catalog is nil")
+	}
+	return d.core.pluginCatalog.ListVersionedPlugins(ctx, pluginType)
 }
 
 // MlockEnabled returns the configuration setting for enabling mlock on plugins.
@@ -334,9 +274,23 @@ func (d dynamicSystemView) GroupsForEntity(entityID string) ([]*logical.Group, e
 }
 
 func (d dynamicSystemView) PluginEnv(_ context.Context) (*logical.PluginEnvironment, error) {
+	v := version.GetVersion()
+
+	buildDate, err := version.GetVaultBuildDate()
+	if err != nil {
+		return nil, err
+	}
+
 	return &logical.PluginEnvironment{
-		VaultVersion: version.GetVersion().Version,
+		VaultVersion:           v.Version,
+		VaultVersionPrerelease: v.VersionPrerelease,
+		VaultVersionMetadata:   v.VersionMetadata,
+		VaultBuildDate:         timestamppb.New(buildDate),
 	}, nil
+}
+
+func (d dynamicSystemView) VaultVersion(_ context.Context) (string, error) {
+	return version.GetVersion().Version, nil
 }
 
 func (d dynamicSystemView) GeneratePasswordFromPolicy(ctx context.Context, policyName string) (password string, err error) {
@@ -368,4 +322,66 @@ func (d dynamicSystemView) GeneratePasswordFromPolicy(ctx context.Context, polic
 	}
 
 	return passPolicy.Generate(ctx, nil)
+}
+
+func (d dynamicSystemView) ClusterID(ctx context.Context) (string, error) {
+	clusterInfo, err := d.core.Cluster(ctx)
+	if err != nil || clusterInfo.ID == "" {
+		return "", fmt.Errorf("unable to retrieve cluster info or empty ID: %w", err)
+	}
+
+	return clusterInfo.ID, nil
+}
+
+func (d dynamicSystemView) GenerateIdentityToken(ctx context.Context, req *pluginutil.IdentityTokenRequest) (*pluginutil.IdentityTokenResponse, error) {
+	mountEntry := d.mountEntry
+	if mountEntry == nil {
+		return nil, fmt.Errorf("no mount entry")
+	}
+	nsCtx := namespace.ContextWithNamespace(ctx, mountEntry.Namespace())
+	storage := d.core.router.MatchingStorageByAPIPath(nsCtx, mountPathIdentity)
+	if storage == nil {
+		return nil, fmt.Errorf("failed to find storage entry for identity mount")
+	}
+
+	token, ttl, err := d.core.IdentityStore().generatePluginIdentityToken(nsCtx, storage, d.mountEntry, req.Audience, req.TTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate plugin identity token: %w", err)
+	}
+
+	return &pluginutil.IdentityTokenResponse{
+		Token: pluginutil.IdentityToken(token),
+		TTL:   ttl,
+	}, nil
+}
+
+func (d dynamicSystemView) RegisterRotationJob(ctx context.Context, req *rotation.RotationJobConfigureRequest) (string, error) {
+	mountEntry := d.mountEntry
+	if mountEntry == nil {
+		return "", fmt.Errorf("no mount entry")
+	}
+	nsCtx := namespace.ContextWithNamespace(ctx, mountEntry.Namespace())
+
+	job, err := rotation.ConfigureRotationJob(req)
+	if err != nil {
+		return "", fmt.Errorf("error configuring rotation job: %s", err)
+	}
+
+	id, err := d.core.RegisterRotationJob(nsCtx, job)
+	if err != nil {
+		return "", fmt.Errorf("error registering rotation job: %s", err)
+	}
+
+	job.RotationID = id
+	return id, nil
+}
+
+func (d dynamicSystemView) DeregisterRotationJob(ctx context.Context, req *rotation.RotationJobDeregisterRequest) (err error) {
+	mountEntry := d.mountEntry
+	if mountEntry == nil {
+		return fmt.Errorf("no mount entry")
+	}
+	nsCtx := namespace.ContextWithNamespace(ctx, mountEntry.Namespace())
+
+	return d.core.DeregisterRotationJob(nsCtx, req)
 }

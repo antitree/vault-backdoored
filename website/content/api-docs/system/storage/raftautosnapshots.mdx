@@ -5,13 +5,18 @@ description: |-
 
   The `/sys/storage/raft/snapshot-auto` endpoints are used to manage automated
   snapshots with Vault's Raft storage backend.
-
-  This is an Enterprise-only feature.
 ---
 
-## Create/update an automated snapshots config
+# `/sys/storage/raft/snapshot-auto`
 
--> **Note**: This feature requires [Vault Enterprise](https://www.hashicorp.com/products/vault/)
+@include 'alerts/enterprise-only.mdx'
+
+@include 'alerts/restricted-root.mdx'
+
+The `/sys/storage/raft/snapshot-auto` endpoints are used to manage automated
+snapshots with Vault's Raft storage backend.
+
+## Create/update an automated snapshots config
 
 **This endpoint requires sudo capability.**
 
@@ -56,10 +61,21 @@ environment variables or files on disk in predefined locations.
 #### storage_type=local
 
 - `local_max_space` `(integer: <required>)` - For `storage_type=local`, the maximum
-  space, in bytes, to use for snapshots. Snapshot attempts will fail if there is not enough
+  space, in bytes, to use for all snapshots with the given `file_prefix` in the `path_prefix` directory. 
+  Snapshot attempts will fail if there is not enough
   space left in this allowance.
 
 #### storage_type=aws-s3
+
+<Note>
+
+Vault cannot use AWS IAM roles with EKS service accounts for authentication to
+save automated integrated storage snapshots to Amazon S3 buckets. You must set
+the [`aws_access_key_id`](/vault/api-docs/system/storage/raftautosnapshots#aws_access_key_id)
+and  [`aws_secret_access_key`](/vault/api-docs/system/storage/raftautosnapshots#aws_secret_access_key)
+parameters in the context of AWS EKS & S3 configuration.
+
+</Note>
 
 - `aws_s3_bucket` `(string: <required>)` - S3 bucket to write snapshots to.
 
@@ -83,7 +99,7 @@ environment variables or files on disk in predefined locations.
 
 - `aws_s3_enable_kms` `(boolean)` - Use KMS to encrypt bucket contents.
 
-- `aws_s3_server_side_encryption` `(boolean)` - Use AES256 to encrypt bucket contents.
+- `aws_s3_server_side_encryption` `(boolean)` - Use AES256 to encrypt bucket contents. Cannot use with `aws_s3_enable_kms` parameter.
 
 - `aws_s3_kms_key` `(string)` - Use named KMS key, when `aws_s3_enable_kms=true`
 
@@ -124,14 +140,17 @@ environment variables or files on disk in predefined locations.
 
 - `azure_account_name` `(string)` - Azure account name.
 
-- `azure_account_key` `(string)` - Azure account key.
+- `azure_auth_mode` `(string)` - One of `shared` or `managed`.
+
+- `azure_account_key` `(string)` - Azure account key. Used for `shared` authentication.
+
+- `azure_client_id` `(string)` - Azure Client ID. Used for `managed` authentication.
 
 - `azure_blob_environment` `(string)` - Azure blob environment.
 
-- `azure_endpoint` `(string)` - Azure blob storage endpoint. This is typically
-  only set when using a non-Azure implementation like Azurite.
+- `azure_endpoint` `(string)` - Azure blob storage endpoint. Set this when using a non-Azure implementation like Azurite.
 
-### Sample Payload
+### Sample payload
 
 ```json
 {
@@ -143,7 +162,7 @@ environment variables or files on disk in predefined locations.
 }
 ```
 
-### Sample Request
+### Sample request
 
 ```shell-session
 $ curl \
@@ -153,7 +172,7 @@ $ curl \
     http://127.0.0.1:8200/v1/sys/storage/raft/snapshot-auto/config/config1
 ```
 
-## List automated snapshots configs
+## List automated snapshots configuration
 
 **This endpoint requires sudo capability.**
 
@@ -163,7 +182,7 @@ This endpoint lists named configurations.
 | :----- | :--------------------------------------- |
 | `LIST` | `/sys/storage/raft/snapshot-auto/config` |
 
-### Sample Request
+### Sample request
 
 ```shell-session
 $ curl \
@@ -172,7 +191,7 @@ $ curl \
     http://127.0.0.1:8200/v1/sys/storage/raft/snapshot-auto/config
 ```
 
-### Sample Response
+### Sample response
 
 ```json
 {
@@ -192,7 +211,7 @@ This endpoint reads a named configuration.
 | :----- | :--------------------------------------------- |
 | `GET`  | `/sys/storage/raft/snapshot-auto/config/:name` |
 
-### Sample Request
+### Sample request
 
 ```shell-session
 $ curl \
@@ -200,7 +219,7 @@ $ curl \
     http://127.0.0.1:8200/v1/sys/storage/raft/snapshot-auto/config/config1
 ```
 
-### Sample Response
+### Sample response
 
 ```json
 {
@@ -225,7 +244,7 @@ This endpoint deletes a named configuration.
 | :------- | :--------------------------------------------- |
 | `DELETE` | `/sys/storage/raft/snapshot-auto/config/:name` |
 
-### Sample Request
+### Sample request
 
 ```shell-session
 $ curl \
@@ -242,7 +261,7 @@ This endpoint returns the status of a named configuration.
 | :----- | :--------------------------------------------- |
 | `GET`  | `/sys/storage/raft/snapshot-auto/status/:name` |
 
-### Sample Request
+### Sample request
 
 ```shell-session
 $ curl \
@@ -250,7 +269,7 @@ $ curl \
     http://127.0.0.1:8200/v1/sys/storage/raft/snapshot-auto/status/config1
 ```
 
-### Sample Response
+### Sample response
 
 ```json
 {

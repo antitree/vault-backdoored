@@ -1,7 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package http
 
 import (
+	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -31,7 +36,11 @@ func handleHelp(core *vault.Core, w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, nil)
 		return
 	}
-	path := ns.TrimmedPath(r.URL.Path[len("/v1/"):])
+	if !strings.HasPrefix(r.URL.Path, "/v1/") {
+		respondError(w, http.StatusNotFound, errors.New("Missing /v1/ prefix in path. Use vault path-help command to retrieve API help for paths"))
+		return
+	}
+	path := trimPath(ns, r.URL.Path)
 
 	req := &logical.Request{
 		Operation:  logical.HelpOperation,

@@ -1,32 +1,32 @@
-'use strict';
-const recommended = require('ember-template-lint/lib/config/recommended').rules; // octane extends recommended - no additions as of 3.14
-const stylistic = require('ember-template-lint/lib/config/stylistic').rules;
-
-const testOverrides = { ...recommended, ...stylistic };
-for (const key in testOverrides) {
-  testOverrides[key] = false;
-}
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
 
 module.exports = {
-  extends: ['octane', 'stylistic'],
+  plugins: ['ember-template-lint-plugin-prettier'],
+
+  extends: ['recommended', 'ember-template-lint-plugin-prettier:recommended'],
+
   rules: {
-    'no-bare-strings': 'off',
     'no-action': 'off',
-    'no-duplicate-landmark-elements': 'warn',
     'no-implicit-this': {
       allow: ['supported-auth-backends'],
     },
     'require-input-label': 'off',
-    'no-down-event-binding': 'warn',
-    'self-closing-void-elements': 'off',
+    'no-array-prototype-extensions': 'off',
+    // from bump to ember-template-lint@6.0.0
+    'no-builtin-form-components': 'off',
+    'no-at-ember-render-modifiers': 'off',
+    'no-unnecessary-curly-strings': 'off',
+    'no-unnecessary-curly-parens': 'off',
   },
-  ignore: ['lib/story-md', 'tests/**'],
-  // ember language server vscode extension does not currently respect the ignore field
-  // override all rules manually as workround to align with cli
   overrides: [
     {
       files: ['**/*-test.js'],
-      rules: testOverrides,
+      rules: {
+        prettier: false,
+      },
     },
   ],
 };

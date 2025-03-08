@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package fairshare
 
 import (
@@ -122,7 +125,7 @@ func (j *JobManager) AddJob(job Job, queueID string) {
 	}
 }
 
-// GetCurrentJobCount returns the total number of pending jobs in the job manager
+// GetPendingJobCount returns the total number of pending jobs in the job manager
 func (j *JobManager) GetPendingJobCount() int {
 	j.l.RLock()
 	defer j.l.RUnlock()
@@ -139,7 +142,12 @@ func (j *JobManager) GetPendingJobCount() int {
 func (j *JobManager) GetWorkerCounts() map[string]int {
 	j.l.RLock()
 	defer j.l.RUnlock()
-	return j.workerCount
+	workerCounts := make(map[string]int, len(j.workerCount))
+	for k, v := range j.workerCount {
+		workerCounts[k] = v
+	}
+
+	return workerCounts
 }
 
 // GetWorkQueueLengths() returns a map of queue ID to number of jobs in the queue
@@ -265,6 +273,10 @@ func (j *JobManager) assignWork() {
 	j.wg.Add(1)
 
 	go func() {
+		// ticker is used to prevent memory leak of using time.After in
+		// for - select pattern.
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			for {
 				// assign work while there are jobs to distribute
@@ -291,13 +303,14 @@ func (j *JobManager) assignWork() {
 				}
 			}
 
+			ticker.Reset(50 * time.Millisecond)
 			select {
 			case <-j.quit:
 				j.wg.Done()
 				return
 			case <-j.newWork:
 				// listen for wake-up when an empty job manager has been given work
-			case <-time.After(50 * time.Millisecond):
+			case <-ticker.C:
 				// periodically check if new workers can be assigned. with the
 				// fairsharing worker distribution it can be the case that there
 				// is work waiting, but no queues are eligible for another worker

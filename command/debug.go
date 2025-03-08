@@ -1,27 +1,34 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-secure-stdlib/gatedwriter"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
 	"github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/helper/osutil"
+	"github.com/hashicorp/vault/internalshared/configutil"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/hashicorp/vault/sdk/helper/logging"
-	"github.com/hashicorp/vault/sdk/version"
-	"github.com/mholt/archiver"
-	"github.com/mitchellh/cli"
+	"github.com/hashicorp/vault/version"
 	"github.com/oklog/run"
 	"github.com/posener/complete"
 )
@@ -56,6 +63,7 @@ type debugIndex struct {
 	Version                int                    `json:"version"`
 	VaultAddress           string                 `json:"vault_address"`
 	ClientVersion          string                 `json:"client_version"`
+	ServerVersion          string                 `json:"server_version"`
 	Timestamp              time.Time              `json:"timestamp"`
 	DurationSeconds        int                    `json:"duration_seconds"`
 	IntervalSeconds        int                    `json:"interval_seconds"`
@@ -89,6 +97,9 @@ type DebugCommand struct {
 	flagMetricsInterval time.Duration
 	flagOutput          string
 	flagTargets         []string
+
+	// logFormat defines the output format for Monitor
+	logFormat string
 
 	// debugIndex is used to keep track of the index state, which gets written
 	// to a file at the end.
@@ -177,6 +188,14 @@ func (c *DebugCommand) Flags() *FlagSets {
 			"replication-status, server-status, log.",
 	})
 
+	f.StringVar(&StringVar{
+		Name:    "log-format",
+		Target:  &c.logFormat,
+		Default: "standard",
+		Usage: "Log format to be captured if \"log\" target specified. " +
+			"Supported values are \"standard\" and \"json\". The default is \"standard\".",
+	})
+
 	return set
 }
 
@@ -193,7 +212,7 @@ Usage: vault debug [options]
   output. The command uses the Vault address and token as specified via
   the login command, environment variables, or CLI flags.
 
-  To create a debug package using default duration and interval values in the 
+  To create a debug package using default duration and interval values in the
   current directory that captures all applicable targets:
 
   $ vault debug
@@ -243,6 +262,7 @@ func (c *DebugCommand) Run(args []string) int {
 	c.UI.Output("==> Starting debug capture...")
 	c.UI.Info(fmt.Sprintf("         Vault Address: %s", c.debugIndex.VaultAddress))
 	c.UI.Info(fmt.Sprintf("        Client Version: %s", c.debugIndex.ClientVersion))
+	c.UI.Info(fmt.Sprintf("        Server Version: %s", c.debugIndex.ServerVersion))
 	c.UI.Info(fmt.Sprintf("              Duration: %s", c.flagDuration))
 	c.UI.Info(fmt.Sprintf("              Interval: %s", c.flagInterval))
 	c.UI.Info(fmt.Sprintf("      Metrics Interval: %s", c.flagMetricsInterval))
@@ -334,7 +354,7 @@ func (c *DebugCommand) generateIndex() error {
 
 		dir, file := filepath.Split(relPath)
 		if len(dir) != 0 {
-			dir = strings.TrimSuffix(dir, "/")
+			dir = filepath.Clean(dir)
 			filesArr := outputLayout[dir].(map[string]interface{})["files"]
 			outputLayout[dir].(map[string]interface{})["files"] = append(filesArr.([]string), file)
 		} else {
@@ -356,7 +376,7 @@ func (c *DebugCommand) generateIndex() error {
 	}
 
 	// Write out file
-	if err := ioutil.WriteFile(filepath.Join(c.flagOutput, "index.json"), bytes, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(c.flagOutput, "index.json"), bytes, 0o600); err != nil {
 		return fmt.Errorf("error generating index file; %s", err)
 	}
 
@@ -410,8 +430,19 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unable to create client to connect to Vault: %s", err)
 	}
-	if _, err := client.Sys().Health(); err != nil {
+	serverHealth, err := client.Sys().Health()
+	if err != nil {
 		return "", fmt.Errorf("unable to connect to the server: %s", err)
+	}
+
+	// Check if server is DR Secondary and we need to further
+	// ignore any targets due to endpoint restrictions
+	if serverHealth.ReplicationDRMode == "secondary" {
+		invalidDRTargets := strutil.Difference(c.flagTargets, c.validDRSecondaryTargets(), true)
+		if len(invalidDRTargets) != 0 {
+			c.UI.Info(fmt.Sprintf("Ignoring invalid targets for DR Secondary: %s", strings.Join(invalidDRTargets, ", ")))
+			c.flagTargets = strutil.Difference(c.flagTargets, invalidDRTargets, true)
+		}
 	}
 	c.cachedClient = client
 
@@ -422,7 +453,7 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 	}
 
 	// Strip trailing slash before proceeding
-	c.flagOutput = strings.TrimSuffix(c.flagOutput, "/")
+	c.flagOutput = filepath.Clean(c.flagOutput)
 
 	// If compression is enabled, trim the extension so that the files are
 	// written to a directory even if compression somehow fails. We ensure the
@@ -453,7 +484,7 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 	_, err = os.Stat(c.flagOutput)
 	switch {
 	case os.IsNotExist(err):
-		err := os.MkdirAll(c.flagOutput, 0o755)
+		err := os.MkdirAll(c.flagOutput, 0o700)
 		if err != nil {
 			return "", fmt.Errorf("unable to create output directory: %s", err)
 		}
@@ -465,8 +496,9 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 
 	// Populate initial index fields
 	c.debugIndex = &debugIndex{
-		VaultAddress:           client.Address(),
+		VaultAddress:           configutil.NormalizeAddr(client.Address()),
 		ClientVersion:          version.GetVersion().VersionNumber(),
+		ServerVersion:          serverHealth.Version,
 		Compress:               c.flagCompress,
 		DurationSeconds:        int(c.flagDuration.Seconds()),
 		IntervalSeconds:        int(c.flagInterval.Seconds()),
@@ -483,6 +515,10 @@ func (c *DebugCommand) preflight(rawArgs []string) (string, error) {
 
 func (c *DebugCommand) defaultTargets() []string {
 	return []string{"config", "host", "requests", "metrics", "pprof", "replication-status", "server-status", "log"}
+}
+
+func (c *DebugCommand) validDRSecondaryTargets() []string {
+	return []string{"metrics", "replication-status", "server-status"}
 }
 
 func (c *DebugCommand) captureStaticTargets() error {
@@ -653,17 +689,18 @@ func (c *DebugCommand) collectHostInfo(ctx context.Context) {
 			return
 		}
 		if resp != nil {
-			defer resp.Body.Close()
-
 			secret, err := api.ParseSecret(resp.Body)
 			if err != nil {
 				c.captureError("host", err)
+				resp.Body.Close()
 				return
 			}
 			if secret != nil && secret.Data != nil {
 				hostEntry := secret.Data
 				c.hostInfoCollection = append(c.hostInfoCollection, hostEntry)
 			}
+
+			resp.Body.Close()
 		}
 	}
 }
@@ -683,21 +720,6 @@ func (c *DebugCommand) collectMetrics(ctx context.Context) {
 
 		c.logger.Info("capturing metrics", "count", idxCount)
 		idxCount++
-
-		healthStatus, err := c.cachedClient.Sys().Health()
-		if err != nil {
-			c.captureError("metrics", err)
-			continue
-		}
-
-		// Check replication status. We skip on processing metrics if we're one
-		// a DR node, though non-perf standbys will fail if they aren't using
-		// unauthenticated_metrics_access.
-		switch {
-		case healthStatus.ReplicationDRMode == "secondary":
-			c.logger.Info("skipping metrics capture on DR secondary node")
-			continue
-		}
 
 		// Perform metrics request
 		r := c.cachedClient.NewRequest("GET", "/v1/sys/metrics")
@@ -741,7 +763,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 		// Create a sub-directory for pprof data
 		currentDir := currentTimestamp.Format(fileFriendlyTimeFormat)
 		dirName := filepath.Join(c.flagOutput, currentDir)
-		if err := os.MkdirAll(dirName, 0o755); err != nil {
+		if err := os.MkdirAll(dirName, 0o700); err != nil {
 			c.UI.Error(fmt.Sprintf("Error creating sub-directory for time interval: %s", err))
 			continue
 		}
@@ -758,7 +780,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 					return
 				}
 
-				err = ioutil.WriteFile(filepath.Join(dirName, target+".prof"), data, 0o644)
+				err = os.WriteFile(filepath.Join(dirName, target+".prof"), data, 0o600)
 				if err != nil {
 					c.captureError("pprof."+target, err)
 				}
@@ -776,13 +798,13 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 				return
 			}
 
-			err = ioutil.WriteFile(filepath.Join(dirName, "goroutines.txt"), data, 0o644)
+			err = os.WriteFile(filepath.Join(dirName, "goroutines.txt"), data, 0o600)
 			if err != nil {
 				c.captureError("pprof.goroutines-text", err)
 			}
 		}()
 
-		// If the our remaining duration is less than the interval value
+		// If our remaining duration is less than the interval value
 		// skip profile and trace.
 		runDuration := currentTimestamp.Sub(startTime)
 		if (c.flagDuration+debugDurationGrace)-runDuration < c.flagInterval {
@@ -800,7 +822,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 				return
 			}
 
-			err = ioutil.WriteFile(filepath.Join(dirName, "profile.prof"), data, 0o644)
+			err = os.WriteFile(filepath.Join(dirName, "profile.prof"), data, 0o600)
 			if err != nil {
 				c.captureError("pprof.profile", err)
 			}
@@ -816,7 +838,7 @@ func (c *DebugCommand) collectPprof(ctx context.Context) {
 				return
 			}
 
-			err = ioutil.WriteFile(filepath.Join(dirName, "trace.out"), data, 0o644)
+			err = os.WriteFile(filepath.Join(dirName, "trace.out"), data, 0o600)
 			if err != nil {
 				c.captureError("pprof.trace", err)
 			}
@@ -952,7 +974,7 @@ func (c *DebugCommand) persistCollection(collection []map[string]interface{}, ou
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(filepath.Join(c.flagOutput, outFile), bytes, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(c.flagOutput, outFile), bytes, 0o600); err != nil {
 		return err
 	}
 
@@ -960,14 +982,104 @@ func (c *DebugCommand) persistCollection(collection []map[string]interface{}, ou
 }
 
 func (c *DebugCommand) compress(dst string) error {
-	tgz := archiver.NewTarGz()
-	if err := tgz.Archive([]string{c.flagOutput}, dst); err != nil {
-		return fmt.Errorf("failed to compress data: %s", err)
+	if runtime.GOOS != "windows" {
+		defer osutil.Umask(osutil.Umask(0o077))
+	}
+
+	if err := archiveToTgz(c.flagOutput, dst); err != nil {
+		return fmt.Errorf("failed to compress data: %w", err)
 	}
 
 	// If everything is fine up to this point, remove original directory
 	if err := os.RemoveAll(c.flagOutput); err != nil {
-		return fmt.Errorf("failed to remove data directory: %s", err)
+		return fmt.Errorf("failed to remove data directory: %w", err)
+	}
+
+	return nil
+}
+
+// archiveToTgz compresses all the files in sourceDir to a
+// a tarball at destination.
+func archiveToTgz(sourceDir, destination string) error {
+	file, err := os.Create(destination)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	gzipWriter := gzip.NewWriter(file)
+	defer gzipWriter.Close()
+
+	tarWriter := tar.NewWriter(gzipWriter)
+	defer tarWriter.Close()
+
+	err = filepath.Walk(sourceDir,
+		func(filePath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			return addFileToTar(sourceDir, filePath, tarWriter)
+		})
+
+	return err
+}
+
+// addFileToTar takes a file at filePath and adds it to the tar
+// being written to by tarWriter, alongside its header.
+// The tar header name will be relative. Example: If we're tarring
+// a file in ~/a/b/c/foo/bar.json, the header name will be foo/bar.json
+func addFileToTar(sourceDir, filePath string, tarWriter *tar.Writer) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %q: %w", filePath, err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file %q: %w", filePath, err)
+	}
+
+	var link string
+	mode := stat.Mode()
+	if mode&os.ModeSymlink != 0 {
+		if link, err = os.Readlink(filePath); err != nil {
+			return fmt.Errorf("failed to read symlink for file %q: %w", filePath, err)
+		}
+	}
+	tarHeader, err := tar.FileInfoHeader(stat, link)
+	if err != nil {
+		return fmt.Errorf("failed to create tar header for file %q: %w", filePath, err)
+	}
+
+	// The tar header name should be relative, so remove the sourceDir from it,
+	// but preserve the last directory name.
+	// Example: If we're tarring a file in ~/a/b/c/foo/bar.json
+	// The name should be foo/bar.json
+	sourceDirExceptLastDir := filepath.Dir(sourceDir)
+	headerName := strings.TrimPrefix(filepath.Clean(filePath), filepath.Clean(sourceDirExceptLastDir)+"/")
+
+	// Directories should end with a slash.
+	if stat.IsDir() && !strings.HasSuffix(headerName, "/") {
+		headerName += "/"
+	}
+	tarHeader.Name = headerName
+
+	err = tarWriter.WriteHeader(tarHeader)
+	if err != nil {
+		return fmt.Errorf("failed to write tar header for file %q: %w", filePath, err)
+	}
+
+	// If it's not a regular file (e.g. link or directory) we shouldn't
+	// copy the file. The body of a tar entry (i.e. what's done by the
+	// below io.Copy call) is only required for tar files of TypeReg.
+	if tarHeader.Typeflag != tar.TypeReg {
+		return nil
+	}
+
+	_, err = io.Copy(tarWriter, file)
+	if err != nil {
+		return fmt.Errorf("failed to copy file %q into tarball: %w", filePath, err)
 	}
 
 	return nil
@@ -984,7 +1096,7 @@ func pprofTarget(ctx context.Context, client *api.Client, target string, params 
 	}
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -1004,7 +1116,7 @@ func pprofProfile(ctx context.Context, client *api.Client, duration time.Duratio
 	}
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -1024,7 +1136,7 @@ func pprofTrace(ctx context.Context, client *api.Client, duration time.Duration)
 	}
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -1044,14 +1156,25 @@ func (c *DebugCommand) captureError(target string, err error) {
 }
 
 func (c *DebugCommand) writeLogs(ctx context.Context) {
-	out, err := os.Create(filepath.Join(c.flagOutput, "vault.log"))
+	out, err := os.OpenFile(filepath.Join(c.flagOutput, "vault.log"), os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		c.captureError("log", err)
 		return
 	}
 	defer out.Close()
 
-	logCh, err := c.cachedClient.Sys().Monitor(ctx, "trace")
+	// Create Monitor specific client based on the cached client
+	mClient, err := c.cachedClient.Clone()
+	if err != nil {
+		c.captureError("log", err)
+		return
+	}
+	mClient.SetToken(c.cachedClient.Token())
+
+	// Set timeout to match the context explicitly
+	mClient.SetClientTimeout(c.flagDuration + debugDurationGrace)
+
+	logCh, err := mClient.Sys().Monitor(ctx, "trace", c.logFormat)
 	if err != nil {
 		c.captureError("log", err)
 		return
@@ -1060,13 +1183,15 @@ func (c *DebugCommand) writeLogs(ctx context.Context) {
 	for {
 		select {
 		case log := <-logCh:
-			if !strings.HasSuffix(log, "\n") {
-				log += "\n"
-			}
-			_, err = out.WriteString(log)
-			if err != nil {
-				c.captureError("log", err)
-				return
+			if len(log) > 0 {
+				if !strings.HasSuffix(log, "\n") {
+					log += "\n"
+				}
+				_, err = out.WriteString(log)
+				if err != nil {
+					c.captureError("log", err)
+					return
+				}
 			}
 		case <-ctx.Done():
 			return

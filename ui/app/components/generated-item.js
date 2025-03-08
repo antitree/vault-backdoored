@@ -1,7 +1,12 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import AdapterError from '@ember-data/adapter/error';
-import { inject as service } from '@ember/service';
+import { service } from '@ember/service';
 import Component from '@ember/component';
-import { computed, set } from '@ember/object';
+import { computed } from '@ember/object';
 import { task } from 'ember-concurrency';
 import { waitFor } from '@ember/test-waiters';
 
@@ -25,13 +30,32 @@ export default Component.extend({
   itemType: null,
   flashMessages: service(),
   router: service(),
-  validationMessages: null,
+  modelValidations: null,
   isFormInvalid: false,
   props: computed('model', function () {
     return this.model.serialize();
   }),
+  validateForm() {
+    // Only validate on new models because blank passwords will not be updated
+    // in practice this only happens for userpass users
+    if (this.model.validate && this.model.isNew) {
+      const { isValid, state } = this.model.validate();
+      this.setProperties({
+        modelValidations: state,
+        isFormInvalid: !isValid,
+      });
+      return isValid;
+    } else {
+      this.set('isFormInvalid', false);
+      return true;
+    }
+  },
   saveModel: task(
     waitFor(function* () {
+      const isValid = this.validateForm();
+      if (!isValid) {
+        return;
+      }
       try {
         yield this.model.save();
       } catch (err) {
@@ -48,14 +72,13 @@ export default Component.extend({
   ),
   init() {
     this._super(...arguments);
-    this.set('validationMessages', {});
     if (this.mode === 'edit') {
       // For validation to work in edit mode,
       // reconstruct the model values from field group
       this.model.fieldGroups.forEach((element) => {
         if (element.default) {
           element.default.forEach((attr) => {
-            let fieldValue = attr.options && attr.options.fieldValue;
+            const fieldValue = attr.options && attr.options.fieldValue;
             if (fieldValue) {
               this.model[attr.name] = this.model[fieldValue];
             }
@@ -67,19 +90,6 @@ export default Component.extend({
   actions: {
     onKeyUp(name, value) {
       this.model.set(name, value);
-      if (this.model.validations) {
-        // Set validation error message for updated attribute
-        this.model.validations.attrs[name] && this.model.validations.attrs[name].isValid
-          ? set(this.validationMessages, name, '')
-          : set(this.validationMessages, name, this.model.validations.attrs[name].message);
-
-        // Set form button state
-        this.model.validate().then(({ validations }) => {
-          this.set('isFormInvalid', !validations.isValid);
-        });
-      } else {
-        this.set('isFormInvalid', false);
-      }
     },
     deleteItem() {
       this.model.destroyRecord().then(() => {

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package certutil
 
 import (
@@ -10,14 +13,15 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"net/url"
@@ -26,6 +30,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/vault/sdk/helper/cryptoutil"
 	"github.com/hashicorp/vault/sdk/helper/errutil"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/mitchellh/mapstructure"
@@ -49,13 +54,65 @@ var expectedNISTPCurveHashBits = map[int]int{
 	521: 512,
 }
 
+// Mapping of constant names<->constant values for SignatureAlgorithm
+var SignatureAlgorithmNames = map[string]x509.SignatureAlgorithm{
+	"sha256withrsa":    x509.SHA256WithRSA,
+	"sha384withrsa":    x509.SHA384WithRSA,
+	"sha512withrsa":    x509.SHA512WithRSA,
+	"ecdsawithsha256":  x509.ECDSAWithSHA256,
+	"ecdsawithsha384":  x509.ECDSAWithSHA384,
+	"ecdsawithsha512":  x509.ECDSAWithSHA512,
+	"sha256withrsapss": x509.SHA256WithRSAPSS,
+	"sha384withrsapss": x509.SHA384WithRSAPSS,
+	"sha512withrsapss": x509.SHA512WithRSAPSS,
+	"pureed25519":      x509.PureEd25519,
+	"ed25519":          x509.PureEd25519, // Duplicated for clarity; most won't expect the "Pure" prefix.
+}
+
+// Mapping of constant values<->constant names for SignatureAlgorithm
+var InvSignatureAlgorithmNames = map[x509.SignatureAlgorithm]string{
+	x509.SHA256WithRSA:    "SHA256WithRSA",
+	x509.SHA384WithRSA:    "SHA384WithRSA",
+	x509.SHA512WithRSA:    "SHA512WithRSA",
+	x509.ECDSAWithSHA256:  "ECDSAWithSHA256",
+	x509.ECDSAWithSHA384:  "ECDSAWithSHA384",
+	x509.ECDSAWithSHA512:  "ECDSAWithSHA512",
+	x509.SHA256WithRSAPSS: "SHA256WithRSAPSS",
+	x509.SHA384WithRSAPSS: "SHA384WithRSAPSS",
+	x509.SHA512WithRSAPSS: "SHA512WithRSAPSS",
+	x509.PureEd25519:      "Ed25519",
+}
+
+// OIDs for X.509 SAN Extension
+var OidExtensionSubjectAltName = asn1.ObjectIdentifier([]int{2, 5, 29, 17})
+
+// OID for RFC 5280 CRL Number extension.
+//
+// > id-ce-cRLNumber OBJECT IDENTIFIER ::= { id-ce 20 }
+var CRLNumberOID = asn1.ObjectIdentifier([]int{2, 5, 29, 20})
+
+// OID for RFC 5280 Delta CRL Indicator CRL extension.
+//
+// > id-ce-deltaCRLIndicator OBJECT IDENTIFIER ::= { id-ce 27 }
+var DeltaCRLIndicatorOID = asn1.ObjectIdentifier([]int{2, 5, 29, 27})
+
+// OID for KeyUsage from RFC 2459 : https://www.rfc-editor.org/rfc/rfc2459.html#section-4.2.1.3
+//
+// > id-ce-keyUsage OBJECT IDENTIFIER ::=  { id-ce 15 }
+var KeyUsageOID = asn1.ObjectIdentifier([]int{2, 5, 29, 15})
+
+// OID for Extended Key Usage from RFC 5280 : https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.12
+//
+// id-ce-extKeyUsage OBJECT IDENTIFIER ::= { id-ce 37 }
+var ExtendedKeyUsageOID = asn1.ObjectIdentifier([]int{2, 5, 29, 37})
+
 // GetHexFormatted returns the byte buffer formatted in hex with
 // the specified separator between bytes.
 func GetHexFormatted(buf []byte, sep string) string {
 	var ret bytes.Buffer
 	for _, cur := range buf {
 		if ret.Len() > 0 {
-			fmt.Fprintf(&ret, sep)
+			fmt.Fprint(&ret, sep)
 		}
 		fmt.Fprintf(&ret, "%02x", cur)
 	}
@@ -66,13 +123,13 @@ func GetHexFormatted(buf []byte, sep string) string {
 func ParseHexFormatted(in, sep string) []byte {
 	var ret bytes.Buffer
 	var err error
-	var inBits int64
+	var inBits uint64
 	inBytes := strings.Split(in, sep)
 	for _, inByte := range inBytes {
-		if inBits, err = strconv.ParseInt(inByte, 16, 8); err != nil {
+		if inBits, err = strconv.ParseUint(inByte, 16, 8); err != nil {
 			return nil
 		}
-		ret.WriteByte(byte(inBits))
+		ret.WriteByte(uint8(inBits))
 	}
 	return ret.Bytes()
 }
@@ -84,10 +141,20 @@ func GetSubjKeyID(privateKey crypto.Signer) ([]byte, error) {
 	if privateKey == nil {
 		return nil, errutil.InternalError{Err: "passed-in private key is nil"}
 	}
-	return getSubjectKeyID(privateKey.Public())
+	return GetSubjectKeyID(privateKey.Public())
 }
 
-func getSubjectKeyID(pub interface{}) ([]byte, error) {
+// Returns the explicit SKID when used for cross-signing, else computes a new
+// SKID from the key itself.
+func getSubjectKeyIDFromBundle(data *CreationBundle) ([]byte, error) {
+	if len(data.Params.SKID) > 0 {
+		return data.Params.SKID, nil
+	}
+
+	return GetSubjectKeyID(data.CSR.PublicKey)
+}
+
+func GetSubjectKeyID(pub interface{}) ([]byte, error) {
 	var publicKeyBytes []byte
 	switch pub := pub.(type) {
 	case *rsa.PublicKey:
@@ -150,6 +217,49 @@ func ParsePKIJSON(input []byte) (*ParsedCertBundle, error) {
 	return nil, errutil.UserError{Err: "unable to parse out of either secret data or a secret object"}
 }
 
+func ParseDERKey(privateKeyBytes []byte) (signer crypto.Signer, format BlockType, err error) {
+	var firstError error
+	if signer, firstError = x509.ParseECPrivateKey(privateKeyBytes); firstError == nil {
+		format = ECBlock
+		return
+	}
+
+	var secondError error
+	if signer, secondError = x509.ParsePKCS1PrivateKey(privateKeyBytes); secondError == nil {
+		format = PKCS1Block
+		return
+	}
+
+	var thirdError error
+	var rawKey interface{}
+	if rawKey, thirdError = x509.ParsePKCS8PrivateKey(privateKeyBytes); thirdError == nil {
+		switch rawSigner := rawKey.(type) {
+		case *rsa.PrivateKey:
+			signer = rawSigner
+		case *ecdsa.PrivateKey:
+			signer = rawSigner
+		case ed25519.PrivateKey:
+			signer = rawSigner
+		default:
+			return nil, UnknownBlock, errutil.InternalError{Err: "unknown type for parsed PKCS8 Private Key"}
+		}
+
+		format = PKCS8Block
+		return
+	}
+
+	return nil, UnknownBlock, fmt.Errorf("got errors attempting to parse DER private key:\n1. %v\n2. %v\n3. %v", firstError, secondError, thirdError)
+}
+
+func ParsePEMKey(keyPem string) (crypto.Signer, BlockType, error) {
+	pemBlock, _ := pem.Decode([]byte(keyPem))
+	if pemBlock == nil {
+		return nil, UnknownBlock, errutil.UserError{Err: "no data found in PEM block"}
+	}
+
+	return ParseDERKey(pemBlock.Bytes)
+}
+
 // ParsePEMBundle takes a string of concatenated PEM-format certificate
 // and private key values and decodes/parses them, checking validity along
 // the way. The first certificate must be the subject certificate and issuing
@@ -170,43 +280,19 @@ func ParsePEMBundle(pemBundle string) (*ParsedCertBundle, error) {
 			return nil, errutil.UserError{Err: "no data found in PEM block"}
 		}
 
-		if signer, err := x509.ParseECPrivateKey(pemBlock.Bytes); err == nil {
+		if signer, format, err := ParseDERKey(pemBlock.Bytes); err == nil {
 			if parsedBundle.PrivateKeyType != UnknownPrivateKey {
 				return nil, errutil.UserError{Err: "more than one private key given; provide only one private key in the bundle"}
 			}
-			parsedBundle.PrivateKeyFormat = ECBlock
-			parsedBundle.PrivateKeyType = ECPrivateKey
+
+			parsedBundle.PrivateKeyFormat = format
+			parsedBundle.PrivateKeyType = GetPrivateKeyTypeFromSigner(signer)
+			if parsedBundle.PrivateKeyType == UnknownPrivateKey {
+				return nil, errutil.UserError{Err: "Unknown type of private key included in the bundle: %v"}
+			}
+
 			parsedBundle.PrivateKeyBytes = pemBlock.Bytes
 			parsedBundle.PrivateKey = signer
-
-		} else if signer, err := x509.ParsePKCS1PrivateKey(pemBlock.Bytes); err == nil {
-			if parsedBundle.PrivateKeyType != UnknownPrivateKey {
-				return nil, errutil.UserError{Err: "more than one private key given; provide only one private key in the bundle"}
-			}
-			parsedBundle.PrivateKeyType = RSAPrivateKey
-			parsedBundle.PrivateKeyFormat = PKCS1Block
-			parsedBundle.PrivateKeyBytes = pemBlock.Bytes
-			parsedBundle.PrivateKey = signer
-		} else if signer, err := x509.ParsePKCS8PrivateKey(pemBlock.Bytes); err == nil {
-			parsedBundle.PrivateKeyFormat = PKCS8Block
-
-			if parsedBundle.PrivateKeyType != UnknownPrivateKey {
-				return nil, errutil.UserError{Err: "More than one private key given; provide only one private key in the bundle"}
-			}
-			switch signer := signer.(type) {
-			case *rsa.PrivateKey:
-				parsedBundle.PrivateKey = signer
-				parsedBundle.PrivateKeyType = RSAPrivateKey
-				parsedBundle.PrivateKeyBytes = pemBlock.Bytes
-			case *ecdsa.PrivateKey:
-				parsedBundle.PrivateKey = signer
-				parsedBundle.PrivateKeyType = ECPrivateKey
-				parsedBundle.PrivateKeyBytes = pemBlock.Bytes
-			case ed25519.PrivateKey:
-				parsedBundle.PrivateKey = signer
-				parsedBundle.PrivateKeyType = Ed25519PrivateKey
-				parsedBundle.PrivateKeyBytes = pemBlock.Bytes
-			}
 		} else if certificates, err := x509.ParseCertificates(pemBlock.Bytes); err == nil {
 			certPath = append(certPath, &CertBlock{
 				Certificate: certificates[0],
@@ -226,11 +312,27 @@ func ParsePEMBundle(pemBundle string) (*ParsedCertBundle, error) {
 		}
 	}
 
-	if err := parsedBundle.Verify(); err != nil {
-		return nil, errutil.UserError{Err: fmt.Sprintf("verification of parsed bundle failed: %s", err)}
+	if len(certPath) > 1 {
+		// Don't validate the certificate chain if no certificate exists eg. only a key is given
+		// And don't validate a chain if it isn't given (eg. only one certificate)
+		if err := parsedBundle.Verify(); err != nil {
+			return nil, errutil.UserError{Err: fmt.Sprintf("verification of parsed bundle failed: %s", err)}
+		}
 	}
 
 	return parsedBundle, nil
+}
+
+func (p *ParsedCertBundle) ToTLSCertificate() tls.Certificate {
+	var cert tls.Certificate
+	cert.Certificate = append(cert.Certificate, p.CertificateBytes)
+	cert.Leaf = p.Certificate
+	cert.PrivateKey = p.PrivateKey
+	for _, ca := range p.CAChain {
+		cert.Certificate = append(cert.Certificate, ca.Bytes)
+	}
+
+	return cert
 }
 
 // GeneratePrivateKey generates a private key with the specified type and key bits.
@@ -271,7 +373,7 @@ func generatePrivateKey(keyType string, keyBits int, container ParsedPrivateKeyC
 			return errutil.InternalError{Err: fmt.Sprintf("insecure bit length for RSA private key: %d", keyBits)}
 		}
 		privateKeyType = RSAPrivateKey
-		privateKey, err = rsa.GenerateKey(randReader, keyBits)
+		privateKey, err = cryptoutil.GenerateRSAKey(randReader, keyBits)
 		if err != nil {
 			return errutil.InternalError{Err: fmt.Sprintf("error generating RSA private key: %v", err)}
 		}
@@ -336,7 +438,21 @@ func generateSerialNumber(randReader io.Reader) (*big.Int, error) {
 	return serial, nil
 }
 
-// ComparePublicKeys compares two public keys and returns true if they match
+// ComparePublicKeysAndType compares two public keys and returns true if they match,
+// false if their types or contents differ, and an error on unsupported key types.
+func ComparePublicKeysAndType(key1Iface, key2Iface crypto.PublicKey) (bool, error) {
+	equal, err := ComparePublicKeys(key1Iface, key2Iface)
+	if err != nil {
+		if strings.Contains(err.Error(), "key types do not match:") {
+			return false, nil
+		}
+	}
+
+	return equal, err
+}
+
+// ComparePublicKeys compares two public keys and returns true if they match,
+// returns an error if public key types are mismatched, or they are an unsupported key type.
 func ComparePublicKeys(key1Iface, key2Iface crypto.PublicKey) (bool, error) {
 	switch key1Iface.(type) {
 	case *rsa.PublicKey:
@@ -416,18 +532,30 @@ func ParsePublicKeyPEM(data []byte) (interface{}, error) {
 	return nil, errors.New("data does not contain any valid public keys")
 }
 
-// addPolicyIdentifiers adds certificate policies extension
-//
+// AddPolicyIdentifiers adds certificate policies extension, based on CreationBundle
 func AddPolicyIdentifiers(data *CreationBundle, certTemplate *x509.Certificate) {
-	for _, oidstr := range data.Params.PolicyIdentifiers {
-		oid, err := StringToOid(oidstr)
+	oidOnly := true
+	for _, oidStr := range data.Params.PolicyIdentifiers {
+		oid, err := StringToOid(oidStr)
 		if err == nil {
 			certTemplate.PolicyIdentifiers = append(certTemplate.PolicyIdentifiers, oid)
+		}
+		if err != nil {
+			oidOnly = false
+		}
+	}
+	if !oidOnly { // Because all policy information is held in the same extension, when we use an extra extension to
+		// add policy qualifier information, that overwrites any information in the PolicyIdentifiers field on the Cert
+		// Template, so we need to reparse all the policy identifiers here
+		extension, err := CreatePolicyInformationExtensionFromStorageStrings(data.Params.PolicyIdentifiers)
+		if err == nil {
+			// If this errors out, don't add it, rely on the OIDs parsed into PolicyIdentifiers above
+			certTemplate.ExtraExtensions = append(certTemplate.ExtraExtensions, *extension)
 		}
 	}
 }
 
-// addExtKeyUsageOids adds custom extended key usage OIDs to certificate
+// AddExtKeyUsageOids adds custom extended key usage OIDs to certificate
 func AddExtKeyUsageOids(data *CreationBundle, certTemplate *x509.Certificate) {
 	for _, oidstr := range data.Params.ExtKeyUsageOIDs {
 		oid, err := StringToOid(oidstr)
@@ -585,25 +713,17 @@ func DefaultOrValueKeyBits(keyType string, keyBits int) (int, error) {
 // certain internal circumstances.
 func DefaultOrValueHashBits(keyType string, keyBits int, hashBits int) (int, error) {
 	if keyType == "ec" {
-		// To comply with BSI recommendations Section 4.2 and Mozilla root
-		// store policy section 5.1.2, enforce that NIST P-curves use a hash
-		// length corresponding to curve length. Note that ed25519 does not
-		// the "ec" key type.
-		expectedHashBits := expectedNISTPCurveHashBits[keyBits]
-
-		if expectedHashBits != hashBits && hashBits != 0 {
-			return hashBits, fmt.Errorf("unsupported signature hash algorithm length (%d) for NIST P-%d", hashBits, keyBits)
-		} else if hashBits == 0 {
-			hashBits = expectedHashBits
-		}
+		// Enforcement of curve moved to selectSignatureAlgorithmForECDSA. See
+		// note there about why.
 	} else if keyType == "rsa" && hashBits == 0 {
 		// To match previous behavior (and ignoring NIST's recommendations for
 		// hash size to align with RSA key sizes), default to SHA-2-256.
 		hashBits = 256
-	} else if keyType == "ed25519" || keyType == "ed448" {
+	} else if keyType == "ed25519" || keyType == "ed448" || keyType == "any" {
 		// No-op; ed25519 and ed448 internally specify their own hash and
 		// we do not need to select one. Double hashing isn't supported in
-		// certificate signing and we must
+		// certificate signing. Additionally, the any key type can't know
+		// what hash algorithm to use yet, so default to zero.
 		return 0, nil
 	}
 
@@ -642,7 +762,7 @@ func ValidateDefaultOrValueKeyTypeSignatureLength(keyType string, keyBits int, h
 // Validates that the length of the hash (in bits) used in the signature
 // calculation is a known, approved value.
 func ValidateSignatureLength(keyType string, hashBits int) error {
-	if keyType == "ed25519" || keyType == "ed448" {
+	if keyType == "any" || keyType == "ec" || keyType == "ed25519" || keyType == "ed448" {
 		// ed25519 and ed448 include built-in hashing and is not externally
 		// configurable. There are three modes for each of these schemes:
 		//
@@ -654,6 +774,13 @@ func ValidateSignatureLength(keyType string, hashBits int) error {
 		//
 		// In all cases, we won't have a hash algorithm to validate here, so
 		// return nil.
+		//
+		// Additionally, when KeyType is any, we can't yet validate the
+		// signature algorithm size, so it takes the default zero value.
+		//
+		// When KeyType is ec, we also can't validate this value as we're
+		// forcefully ignoring the users' choice and specifying a value based
+		// on issuer type.
 		return nil
 	}
 
@@ -715,6 +842,58 @@ func CreateCertificateWithKeyGenerator(data *CreationBundle, randReader io.Reade
 	return createCertificate(data, randReader, keyGenerator)
 }
 
+// Set correct RSA sig algo
+func certTemplateSetSigAlgo(certTemplate *x509.Certificate, data *CreationBundle) {
+	if data.Params.UsePSS {
+		switch data.Params.SignatureBits {
+		case 256:
+			certTemplate.SignatureAlgorithm = x509.SHA256WithRSAPSS
+		case 384:
+			certTemplate.SignatureAlgorithm = x509.SHA384WithRSAPSS
+		case 512:
+			certTemplate.SignatureAlgorithm = x509.SHA512WithRSAPSS
+		}
+	} else {
+		switch data.Params.SignatureBits {
+		case 256:
+			certTemplate.SignatureAlgorithm = x509.SHA256WithRSA
+		case 384:
+			certTemplate.SignatureAlgorithm = x509.SHA384WithRSA
+		case 512:
+			certTemplate.SignatureAlgorithm = x509.SHA512WithRSA
+		}
+	}
+}
+
+// selectSignatureAlgorithmForRSA returns the proper x509.SignatureAlgorithm based on various properties set in the
+// Creation Bundle parameter. This method will default to a SHA256 signature algorithm if the requested signature
+// bits is not set/unknown.
+func selectSignatureAlgorithmForRSA(data *CreationBundle) x509.SignatureAlgorithm {
+	if data.Params.UsePSS {
+		switch data.Params.SignatureBits {
+		case 256:
+			return x509.SHA256WithRSAPSS
+		case 384:
+			return x509.SHA384WithRSAPSS
+		case 512:
+			return x509.SHA512WithRSAPSS
+		default:
+			return x509.SHA256WithRSAPSS
+		}
+	}
+
+	switch data.Params.SignatureBits {
+	case 256:
+		return x509.SHA256WithRSA
+	case 384:
+		return x509.SHA384WithRSA
+	case 512:
+		return x509.SHA512WithRSA
+	default:
+		return x509.SHA256WithRSA
+	}
+}
+
 func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGenerator KeyGenerator) (*ParsedCertBundle, error) {
 	var err error
 	result := &ParsedCertBundle{}
@@ -764,10 +943,18 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 	}
 
 	// This will only be filled in from the generation paths
-	if len(data.Params.PermittedDNSDomains) > 0 {
-		certTemplate.PermittedDNSDomains = data.Params.PermittedDNSDomains
-		certTemplate.PermittedDNSDomainsCritical = true
-	}
+	certTemplate.PermittedDNSDomains = append(certTemplate.PermittedDNSDomains, data.Params.PermittedDNSDomains...)
+	certTemplate.ExcludedDNSDomains = append(certTemplate.ExcludedDNSDomains, data.Params.ExcludedDNSDomains...)
+	certTemplate.PermittedIPRanges = append(certTemplate.PermittedIPRanges, data.Params.PermittedIPRanges...)
+	certTemplate.ExcludedIPRanges = append(certTemplate.ExcludedIPRanges, data.Params.ExcludedIPRanges...)
+	certTemplate.PermittedEmailAddresses = append(certTemplate.PermittedEmailAddresses, data.Params.PermittedEmailAddresses...)
+	certTemplate.ExcludedEmailAddresses = append(certTemplate.ExcludedEmailAddresses, data.Params.ExcludedEmailAddresses...)
+	certTemplate.PermittedURIDomains = append(certTemplate.PermittedURIDomains, data.Params.PermittedURIDomains...)
+	certTemplate.ExcludedURIDomains = append(certTemplate.ExcludedURIDomains, data.Params.ExcludedURIDomains...)
+	// Note that it is harmless to set PermittedDNSDomainsCritical even if all other
+	// permitted or excluded fields are empty, as the name constraints extension won't be created in
+	// that case
+	certTemplate.PermittedDNSDomainsCritical = true
 
 	AddPolicyIdentifiers(data, certTemplate)
 
@@ -781,16 +968,13 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 
 	var certBytes []byte
 	if data.SigningBundle != nil {
-		switch data.SigningBundle.PrivateKeyType {
+		privateKeyType := data.SigningBundle.PrivateKeyType
+		if privateKeyType == ManagedPrivateKey {
+			privateKeyType = GetPrivateKeyTypeFromSigner(data.SigningBundle.PrivateKey)
+		}
+		switch privateKeyType {
 		case RSAPrivateKey:
-			switch data.Params.SignatureBits {
-			case 256:
-				certTemplate.SignatureAlgorithm = x509.SHA256WithRSA
-			case 384:
-				certTemplate.SignatureAlgorithm = x509.SHA384WithRSA
-			case 512:
-				certTemplate.SignatureAlgorithm = x509.SHA512WithRSA
-			}
+			certTemplateSetSigAlgo(certTemplate, data)
 		case Ed25519PrivateKey:
 			certTemplate.SignatureAlgorithm = x509.PureEd25519
 		case ECPrivateKey:
@@ -812,14 +996,7 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 
 		switch data.Params.KeyType {
 		case "rsa":
-			switch data.Params.SignatureBits {
-			case 256:
-				certTemplate.SignatureAlgorithm = x509.SHA256WithRSA
-			case 384:
-				certTemplate.SignatureAlgorithm = x509.SHA384WithRSA
-			case 512:
-				certTemplate.SignatureAlgorithm = x509.SHA512WithRSA
-			}
+			certTemplateSetSigAlgo(certTemplate, data)
 		case "ed25519":
 			certTemplate.SignatureAlgorithm = x509.PureEd25519
 		case "ec":
@@ -842,16 +1019,25 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 	}
 
 	if data.SigningBundle != nil {
-		if len(data.SigningBundle.Certificate.AuthorityKeyId) > 0 &&
-			!bytes.Equal(data.SigningBundle.Certificate.AuthorityKeyId, data.SigningBundle.Certificate.SubjectKeyId) {
+		if (len(data.SigningBundle.Certificate.AuthorityKeyId) > 0 &&
+			!bytes.Equal(data.SigningBundle.Certificate.AuthorityKeyId, data.SigningBundle.Certificate.SubjectKeyId)) ||
+			data.Params.ForceAppendCaChain {
+			var chain []*CertBlock
 
-			result.CAChain = []*CertBlock{
-				{
+			signingChain := data.SigningBundle.CAChain
+			// Some bundles already include the root included in the chain, so don't include it twice.
+			if len(signingChain) == 0 || !bytes.Equal(signingChain[0].Bytes, data.SigningBundle.CertificateBytes) {
+				chain = append(chain, &CertBlock{
 					Certificate: data.SigningBundle.Certificate,
 					Bytes:       data.SigningBundle.CertificateBytes,
-				},
+				})
 			}
-			result.CAChain = append(result.CAChain, data.SigningBundle.CAChain...)
+
+			if len(signingChain) > 0 {
+				chain = append(chain, signingChain...)
+			}
+
+			result.CAChain = chain
 		}
 	}
 
@@ -859,16 +1045,25 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 }
 
 func selectSignatureAlgorithmForECDSA(pub crypto.PublicKey, signatureBits int) x509.SignatureAlgorithm {
-	// If signature bits are configured, prefer them to the default choice.
-	switch signatureBits {
-	case 256:
-		return x509.ECDSAWithSHA256
-	case 384:
-		return x509.ECDSAWithSHA384
-	case 512:
-		return x509.ECDSAWithSHA512
-	}
-
+	// Previously we preferred the user-specified signature bits for ECDSA
+	// keys. However, this could result in using a longer hash function than
+	// the underlying NIST P-curve will encode (e.g., a SHA-512 hash with a
+	// P-256 key). This isn't ideal: the hash is implicitly truncated
+	// (effectively turning it into SHA-512/256) and we then need to rely
+	// on the prefix security of the hash. Since both NIST and Mozilla guidance
+	// suggest instead using the correct hash function, we should prefer that
+	// over the operator-specified signatureBits.
+	//
+	// Lastly, note that pub above needs to be the _signer's_ public key;
+	// the issue with DefaultOrValueHashBits is that it is called at role
+	// configuration time, which might _precede_ issuer generation. Thus
+	// it only has access to the desired key type and not the actual issuer.
+	// The reference from that function is reproduced below:
+	//
+	// > To comply with BSI recommendations Section 4.2 and Mozilla root
+	// > store policy section 5.1.2, enforce that NIST P-curves use a hash
+	// > length corresponding to curve length. Note that ed25519 does not
+	// > implement the "ec" key type.
 	key, ok := pub.(*ecdsa.PublicKey)
 	if !ok {
 		return x509.ECDSAWithSHA256
@@ -885,7 +1080,10 @@ func selectSignatureAlgorithmForECDSA(pub crypto.PublicKey, signatureBits int) x
 	}
 }
 
-var oidExtensionBasicConstraints = []int{2, 5, 29, 19}
+var (
+	ExtensionBasicConstraintsOID = []int{2, 5, 29, 19}
+	ExtensionSubjectAltNameOID   = []int{2, 5, 29, 17}
+)
 
 // CreateCSR creates a CSR with the default rand.Reader to
 // generate a cert/keypair. This is currently only meant
@@ -917,12 +1115,21 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 	}
 
 	// Like many root CAs, other information is ignored
+
 	csrTemplate := &x509.CertificateRequest{
 		Subject:        data.Params.Subject,
 		DNSNames:       data.Params.DNSNames,
 		EmailAddresses: data.Params.EmailAddresses,
 		IPAddresses:    data.Params.IPAddresses,
 		URIs:           data.Params.URIs,
+	}
+
+	if data.Params.KeyUsage != 0 {
+		keyUsageExt, err := marshalKeyUsage(data.Params.KeyUsage)
+		if err != nil {
+			return nil, fmt.Errorf("failed marshalling existing key usage: %w", err)
+		}
+		csrTemplate.ExtraExtensions = []pkix.Extension{keyUsageExt}
 	}
 
 	if err := HandleOtherCSRSANs(csrTemplate, data.Params.OtherSANs); err != nil {
@@ -939,7 +1146,7 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 			return nil, errutil.InternalError{Err: errwrap.Wrapf("error marshaling basic constraints: {{err}}", err).Error()}
 		}
 		ext := pkix.Extension{
-			Id:       oidExtensionBasicConstraints,
+			Id:       ExtensionBasicConstraintsOID,
 			Value:    val,
 			Critical: true,
 		}
@@ -948,9 +1155,10 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 
 	switch data.Params.KeyType {
 	case "rsa":
-		csrTemplate.SignatureAlgorithm = x509.SHA256WithRSA
+		// use specified RSA algorithm defaulting to the appropriate SHA256 RSA signature type
+		csrTemplate.SignatureAlgorithm = selectSignatureAlgorithmForRSA(data)
 	case "ec":
-		csrTemplate.SignatureAlgorithm = x509.ECDSAWithSHA256
+		csrTemplate.SignatureAlgorithm = selectSignatureAlgorithmForECDSA(result.PrivateKey.Public(), data.Params.SignatureBits)
 	case "ed25519":
 		csrTemplate.SignatureAlgorithm = x509.PureEd25519
 	}
@@ -966,7 +1174,61 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to parse created certificate: %v", err)}
 	}
 
+	if err = result.CSR.CheckSignature(); err != nil {
+		return nil, errors.New("failed signature validation for CSR")
+	}
+
 	return result, nil
+}
+
+// Marshal Key Usage taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/x509.go;drc=370a6959e3edd9d901446661ee9fef3f72d150d4;l=1339
+// It requires the two following functions (reverseBitsInAByte and asn1BitLength) below, taken from the same code base
+// It's used for that code only for certificates; but we need to marshal key usage on CSR (createCSR above) as well
+func marshalKeyUsage(ku x509.KeyUsage) (pkix.Extension, error) {
+	ext := pkix.Extension{Id: KeyUsageOID, Critical: true}
+
+	var a [2]byte
+	a[0] = reverseBitsInAByte(byte(ku))
+	a[1] = reverseBitsInAByte(byte(ku >> 8))
+
+	l := 1
+	if a[1] != 0 {
+		l = 2
+	}
+
+	bitString := a[:l]
+	var err error
+	ext.Value, err = asn1.Marshal(asn1.BitString{Bytes: bitString, BitLength: asn1BitLength(bitString)})
+	return ext, err
+}
+
+// reverseBitsInAByte Taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/x509.go;drc=370a6959e3edd9d901446661ee9fef3f72d150d4;l=1011
+// needed for marshalKeyUsage called above
+func reverseBitsInAByte(in byte) byte {
+	b1 := in>>4 | in<<4
+	b2 := b1>>2&0x33 | b1<<2&0xcc
+	b3 := b2>>1&0x55 | b2<<1&0xaa
+	return b3
+}
+
+// asn1BitLength returns the bit-length of bitString by considering the
+// most-significant bit in a byte to be the "first" bit. This convention
+// matches ASN.1, but differs from almost everything else.
+func asn1BitLength(bitString []byte) int {
+	bitLen := len(bitString) * 8
+
+	for i := range bitString {
+		b := bitString[len(bitString)-i-1]
+
+		for bit := uint(0); bit < 8; bit++ {
+			if (b>>bit)&1 == 1 {
+				return bitLen
+			}
+			bitLen--
+		}
+	}
+
+	return 0
 }
 
 // SignCertificate performs the heavy lifting
@@ -995,9 +1257,10 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		return nil, errutil.UserError{Err: "nil csr given to signCertificate"}
 	}
 
-	err := data.CSR.CheckSignature()
-	if err != nil {
-		return nil, errutil.UserError{Err: "request signature invalid"}
+	if !data.Params.IgnoreCSRSignature {
+		if err := data.CSR.CheckSignature(); err != nil {
+			return nil, errutil.UserError{Err: "request signature invalid"}
+		}
 	}
 
 	result := &ParsedCertBundle{}
@@ -1007,7 +1270,7 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		return nil, err
 	}
 
-	subjKeyID, err := getSubjectKeyID(data.CSR.PublicKey)
+	subjKeyID, err := getSubjectKeyIDFromBundle(data)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,16 +1289,14 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		certTemplate.NotBefore = time.Now().Add(-1 * data.Params.NotBeforeDuration)
 	}
 
-	switch data.SigningBundle.PrivateKeyType {
+	privateKeyType := data.SigningBundle.PrivateKeyType
+	if privateKeyType == ManagedPrivateKey {
+		privateKeyType = GetPrivateKeyTypeFromSigner(data.SigningBundle.PrivateKey)
+	}
+
+	switch privateKeyType {
 	case RSAPrivateKey:
-		switch data.Params.SignatureBits {
-		case 256:
-			certTemplate.SignatureAlgorithm = x509.SHA256WithRSA
-		case 384:
-			certTemplate.SignatureAlgorithm = x509.SHA384WithRSA
-		case 512:
-			certTemplate.SignatureAlgorithm = x509.SHA512WithRSA
-		}
+		certTemplateSetSigAlgo(certTemplate, data)
 	case ECPrivateKey:
 		switch data.Params.SignatureBits {
 		case 256:
@@ -1057,7 +1318,7 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		certTemplate.URIs = data.CSR.URIs
 
 		for _, name := range data.CSR.Extensions {
-			if !name.Id.Equal(oidExtensionBasicConstraints) {
+			if !name.Id.Equal(ExtensionBasicConstraintsOID) && !(len(data.Params.OtherSANs) > 0 && name.Id.Equal(ExtensionSubjectAltNameOID)) {
 				certTemplate.ExtraExtensions = append(certTemplate.ExtraExtensions, name)
 			}
 		}
@@ -1103,13 +1364,18 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		certTemplate.IsCA = false
 	}
 
-	if len(data.Params.PermittedDNSDomains) > 0 {
-		certTemplate.PermittedDNSDomains = data.Params.PermittedDNSDomains
-		certTemplate.PermittedDNSDomainsCritical = true
-	}
+	certTemplate.PermittedDNSDomains = append(certTemplate.PermittedDNSDomains, data.Params.PermittedDNSDomains...)
+	certTemplate.ExcludedDNSDomains = append(certTemplate.ExcludedDNSDomains, data.Params.ExcludedDNSDomains...)
+	certTemplate.PermittedIPRanges = append(certTemplate.PermittedIPRanges, data.Params.PermittedIPRanges...)
+	certTemplate.ExcludedIPRanges = append(certTemplate.ExcludedIPRanges, data.Params.ExcludedIPRanges...)
+	certTemplate.PermittedEmailAddresses = append(certTemplate.PermittedEmailAddresses, data.Params.PermittedEmailAddresses...)
+	certTemplate.ExcludedEmailAddresses = append(certTemplate.ExcludedEmailAddresses, data.Params.ExcludedEmailAddresses...)
+	certTemplate.PermittedURIDomains = append(certTemplate.PermittedURIDomains, data.Params.PermittedURIDomains...)
+	certTemplate.ExcludedURIDomains = append(certTemplate.ExcludedURIDomains, data.Params.ExcludedURIDomains...)
+	// Note that it is harmless to set PermittedDNSDomainsCritical even if all other permitted/excluded fields are empty
+	certTemplate.PermittedDNSDomainsCritical = true
 
 	certBytes, err = x509.CreateCertificate(randReader, certTemplate, caCert, data.CSR.PublicKey, data.SigningBundle.PrivateKey)
-
 	if err != nil {
 		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to create certificate: %s", err)}
 	}
@@ -1120,17 +1386,17 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to parse created certificate: %s", err)}
 	}
 
-	result.CAChain = data.SigningBundle.GetCAChain()
+	result.CAChain = data.SigningBundle.GetFullChain()
 
 	return result, nil
 }
 
 func NewCertPool(reader io.Reader) (*x509.CertPool, error) {
-	pemBlock, err := ioutil.ReadAll(reader)
+	pemBlock, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}
-	certs, err := parseCertsPEM(pemBlock)
+	certs, err := ParseCertsPEM(pemBlock)
 	if err != nil {
 		return nil, fmt.Errorf("error reading certs: %s", err)
 	}
@@ -1141,9 +1407,9 @@ func NewCertPool(reader io.Reader) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// parseCertsPEM returns the x509.Certificates contained in the given PEM-encoded byte array
+// ParseCertsPEM returns the x509.Certificates contained in the given PEM-encoded byte array
 // Returns an error if a certificate could not be parsed, or if the data does not contain any certificates
-func parseCertsPEM(pemCerts []byte) ([]*x509.Certificate, error) {
+func ParseCertsPEM(pemCerts []byte) ([]*x509.Certificate, error) {
 	ok := false
 	certs := []*x509.Certificate{}
 	for len(pemCerts) > 0 {
@@ -1189,4 +1455,697 @@ func GetPublicKeySize(key crypto.PublicKey) int {
 	}
 
 	return -1
+}
+
+// CreateKeyBundle create a KeyBundle struct object which includes a generated key
+// of keyType with keyBits leveraging the randomness from randReader.
+func CreateKeyBundle(keyType string, keyBits int, randReader io.Reader) (KeyBundle, error) {
+	return CreateKeyBundleWithKeyGenerator(keyType, keyBits, randReader, generatePrivateKey)
+}
+
+// CreateKeyBundleWithKeyGenerator create a KeyBundle struct object which includes
+// a generated key of keyType with keyBits leveraging the randomness from randReader and
+// delegates the actual key generation to keyGenerator
+func CreateKeyBundleWithKeyGenerator(keyType string, keyBits int, randReader io.Reader, keyGenerator KeyGenerator) (KeyBundle, error) {
+	result := KeyBundle{}
+	if err := keyGenerator(keyType, keyBits, &result, randReader); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// CreateDeltaCRLIndicatorExt allows creating correctly formed delta CRLs
+// that point back to the last complete CRL that they're based on.
+func CreateDeltaCRLIndicatorExt(completeCRLNumber int64) (pkix.Extension, error) {
+	bigNum := big.NewInt(completeCRLNumber)
+	bigNumValue, err := asn1.Marshal(bigNum)
+	if err != nil {
+		return pkix.Extension{}, fmt.Errorf("unable to marshal complete CRL number (%v): %v", completeCRLNumber, err)
+	}
+	return pkix.Extension{
+		Id: DeltaCRLIndicatorOID,
+		// > When a conforming CRL issuer generates a delta CRL, the delta
+		// > CRL MUST include a critical delta CRL indicator extension.
+		Critical: true,
+		// This extension only includes the complete CRL number:
+		//
+		// > BaseCRLNumber ::= CRLNumber
+		//
+		// But, this needs to be encoded as a big number for encoding/asn1
+		// to work properly.
+		Value: bigNumValue,
+	}, nil
+}
+
+// ParseBasicConstraintExtension parses a basic constraint pkix.Extension, useful if attempting to validate
+// CSRs are requesting CA privileges as Go does not expose its implementation. Values returned are
+// IsCA, MaxPathLen or error. If MaxPathLen was not set, a value of -1 will be returned.
+func ParseBasicConstraintExtension(ext pkix.Extension) (bool, int, error) {
+	if !ext.Id.Equal(ExtensionBasicConstraintsOID) {
+		return false, -1, fmt.Errorf("passed in extension was not a basic constraint extension")
+	}
+
+	// All elements are set to optional here, as it is possible that we receive a CSR with the extension
+	// containing an empty sequence by spec.
+	type basicConstraints struct {
+		IsCA       bool `asn1:"optional"`
+		MaxPathLen int  `asn1:"optional,default:-1"`
+	}
+	bc := &basicConstraints{}
+	leftOver, err := asn1.Unmarshal(ext.Value, bc)
+	if err != nil {
+		return false, -1, fmt.Errorf("failed unmarshalling extension value: %w", err)
+	}
+
+	numLeftOver := len(bytes.TrimSpace(leftOver))
+	if numLeftOver > 0 {
+		return false, -1, fmt.Errorf("%d extra bytes within basic constraints value extension", numLeftOver)
+	}
+
+	return bc.IsCA, bc.MaxPathLen, nil
+}
+
+// CreateBasicConstraintExtension create a basic constraint extension based on inputs,
+// if isCa is false, an empty value sequence will be returned with maxPath being
+// ignored. If isCa is true maxPath can be set to -1 to not set a maxPath value.
+func CreateBasicConstraintExtension(isCa bool, maxPath int) (pkix.Extension, error) {
+	var asn1Bytes []byte
+	var err error
+
+	switch {
+	case isCa && maxPath >= 0:
+		CaAndMaxPathLen := struct {
+			IsCa       bool `asn1:""`
+			MaxPathLen int  `asn1:""`
+		}{
+			IsCa:       isCa,
+			MaxPathLen: maxPath,
+		}
+		asn1Bytes, err = asn1.Marshal(CaAndMaxPathLen)
+	case isCa && maxPath < 0:
+		justCa := struct {
+			IsCa bool `asn1:""`
+		}{IsCa: isCa}
+		asn1Bytes, err = asn1.Marshal(justCa)
+	default:
+		asn1Bytes, err = asn1.Marshal(struct{}{})
+	}
+
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+
+	return pkix.Extension{
+		Id:       ExtensionBasicConstraintsOID,
+		Critical: true,
+		Value:    asn1Bytes,
+	}, nil
+}
+
+// GetOtherSANsFromX509Extensions is used to find all the extensions which have the identifier (OID) of
+// a SAN (Subject Alternative Name), and then look at each extension to find out if it is one of a set of
+// well-known types (like IP SANs) or "other".  Currently, the only OtherSANs vault supports are of type UTF8.
+func GetOtherSANsFromX509Extensions(exts []pkix.Extension) ([]OtherNameUtf8, error) {
+	var ret []OtherNameUtf8
+	for _, ext := range exts {
+		if !ext.Id.Equal(OidExtensionSubjectAltName) {
+			continue
+		}
+		err := forEachSAN(ext.Value, func(tag int, data []byte) error {
+			if tag != 0 {
+				return nil
+			}
+
+			var other OtherNameRaw
+			_, err := asn1.UnmarshalWithParams(data, &other, "tag:0")
+			if err != nil {
+				return fmt.Errorf("could not parse requested other SAN: %w", err)
+			}
+			val, err := other.ExtractUTF8String()
+			if err != nil {
+				return err
+			}
+			ret = append(ret, *val)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return ret, nil
+}
+
+func forEachSAN(extension []byte, callback func(tag int, data []byte) error) error {
+	// RFC 5280, 4.2.1.6
+
+	// SubjectAltName ::= GeneralNames
+	//
+	// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+	//
+	// GeneralName ::= CHOICE {
+	//      otherName                       [0]     OtherName,
+	//      rfc822Name                      [1]     IA5String,
+	//      dNSName                         [2]     IA5String,
+	//      x400Address                     [3]     ORAddress,
+	//      directoryName                   [4]     Name,
+	//      ediPartyName                    [5]     EDIPartyName,
+	//      uniformResourceIdentifier       [6]     IA5String,
+	//      iPAddress                       [7]     OCTET STRING,
+	//      registeredID                    [8]     OBJECT IDENTIFIER }
+	var seq asn1.RawValue
+	rest, err := asn1.Unmarshal(extension, &seq)
+	if err != nil {
+		return err
+	} else if len(rest) != 0 {
+		return fmt.Errorf("x509: trailing data after X.509 extension")
+	}
+	if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
+		return asn1.StructuralError{Msg: "bad SAN sequence"}
+	}
+
+	rest = seq.Bytes
+	for len(rest) > 0 {
+		var v asn1.RawValue
+		rest, err = asn1.Unmarshal(rest, &v)
+		if err != nil {
+			return err
+		}
+
+		if err := callback(v.Tag, v.FullBytes); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// otherNameRaw describes a name related to a certificate which is not in one
+// of the standard name formats. RFC 5280, 4.2.1.6:
+//
+//	OtherName ::= SEQUENCE {
+//	     type-id    OBJECT IDENTIFIER,
+//	     Value      [0] EXPLICIT ANY DEFINED BY type-id }
+type OtherNameRaw struct {
+	TypeID asn1.ObjectIdentifier
+	Value  asn1.RawValue
+}
+
+type OtherNameUtf8 struct {
+	Oid   string
+	Value string
+}
+
+// String() turns an OtherNameUtf8 object into the storage or field-value used to assign that name
+// to a certificate in an API call
+func (o OtherNameUtf8) String() string {
+	return fmt.Sprintf("%s;%s:%s", o.Oid, "UTF-8", o.Value)
+}
+
+// ExtractUTF8String returns the UTF8 string contained in the Value, or an error
+// if none is present.
+func (oraw *OtherNameRaw) ExtractUTF8String() (*OtherNameUtf8, error) {
+	svalue := cryptobyte.String(oraw.Value.Bytes)
+	var outTag cbasn1.Tag
+	var val cryptobyte.String
+	read := svalue.ReadAnyASN1(&val, &outTag)
+
+	if read && outTag == asn1.TagUTF8String {
+		return &OtherNameUtf8{Oid: oraw.TypeID.String(), Value: string(val)}, nil
+	}
+	return nil, fmt.Errorf("no UTF-8 string found in OtherName")
+}
+
+func getOtherSANsStringFromExtensions(exts []pkix.Extension) (string, error) {
+	otherNames, err := GetOtherSANsFromX509Extensions(exts)
+	if err != nil {
+		return "", err
+	}
+
+	otherSansList := make([]string, len(otherNames))
+	for i, otherName := range otherNames {
+		otherSansList[i] = otherName.String()
+	}
+
+	otherSans := strings.Join(otherSansList, ",")
+
+	return otherSans, nil
+}
+
+func getOtherSANsMapFromExtensions(exts []pkix.Extension) (map[string][]string, error) {
+	otherNames, err := GetOtherSANsFromX509Extensions(exts)
+	if err != nil {
+		return nil, err
+	}
+
+	otherSans := make(map[string][]string)
+	for _, name := range otherNames {
+		if otherSans[name.Oid] == nil {
+			otherSans[name.Oid] = []string{name.Value}
+		} else {
+			otherSans[name.Oid] = append(otherSans[name.Oid], name.Value)
+		}
+	}
+
+	return otherSans, nil
+}
+
+func getKeyUsage(exts []pkix.Extension) (x509.KeyUsage, error) {
+	keyUsage := x509.KeyUsage(0)
+	for _, ext := range exts {
+		if ext.Id.Equal(KeyUsageOID) {
+			return parseKeyUsageExtension(ext.Value)
+		}
+	}
+	return keyUsage, nil
+}
+
+// Taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/parser.go;drc=dd84bb682482390bb8465482cb7b13d2e3b17297;l=319
+func parseKeyUsageExtension(der cryptobyte.String) (x509.KeyUsage, error) {
+	var usageBits asn1.BitString
+	if !der.ReadASN1BitString(&usageBits) {
+		return 0, errors.New("x509: invalid key usage")
+	}
+
+	var usage int
+	for i := 0; i < 9; i++ {
+		if usageBits.At(i) != 0 {
+			usage |= 1 << uint(i)
+		}
+	}
+	return x509.KeyUsage(usage), nil
+}
+
+func getExtKeyUsageOids(exts []pkix.Extension) ([]string, error) {
+	keyUsageOidStrings := make([]string, 0)
+	keyUsageOids := make([]asn1.ObjectIdentifier, 0)
+	for _, ext := range exts {
+		if ext.Id.Equal(ExtendedKeyUsageOID) {
+			_, err := asn1.Unmarshal(ext.Value, &keyUsageOids)
+			if err != nil {
+				return nil, fmt.Errorf("unable to unmarshal KeyUsageOid extension: %w", err)
+			}
+			for _, oid := range keyUsageOids {
+				keyUsageOidStrings = append(keyUsageOidStrings, oid.String())
+			}
+			return keyUsageOidStrings, nil
+		}
+	}
+	return nil, nil
+}
+
+func getPolicyIdentifiers(exts []pkix.Extension) ([]string, error) {
+	policyIdentifiers := make([]string, 0)
+	for _, ext := range exts {
+		if ext.Id.Equal(policyInformationOid) {
+			// PolicyInformation ::= SEQUENCE {
+			//        policyIdentifier   CertPolicyId,
+			//        policyQualifiers   SEQUENCE SIZE (1..MAX) OF
+			//                                PolicyQualifierInfo OPTIONAL }
+			type policyInformation struct {
+				PolicyIdentifier asn1.ObjectIdentifier `asn1:"optional"`
+				PolicyQualifier  any                   `asn1:"optional"`
+			}
+			policies := make([]policyInformation, 0)
+			_, err := asn1.Unmarshal(ext.Value, &policies)
+			if err != nil {
+				return nil, err
+			}
+			for _, policy := range policies {
+				policyIdentifiers = append(policyIdentifiers, policy.PolicyIdentifier.String())
+			}
+			return policyIdentifiers, nil
+		}
+	}
+	return nil, nil
+}
+
+// Translate Certificates and CSRs into Certificate Template
+// Four "Types" Here: Certificates; Certificate Signing Requests; Fields map[string]interface{}; Creation Parameters
+
+func ParseCertificateToCreationParameters(certificate x509.Certificate) (creationParameters CreationParameters, err error) {
+	otherSans, err := getOtherSANsMapFromExtensions(certificate.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+
+	creationParameters = CreationParameters{
+		Subject:        removeNames(certificate.Subject),
+		DNSNames:       certificate.DNSNames,
+		EmailAddresses: certificate.EmailAddresses,
+		IPAddresses:    certificate.IPAddresses,
+		URIs:           certificate.URIs,
+		OtherSANs:      otherSans,
+		IsCA:           certificate.IsCA,
+		KeyType:        GetKeyType(certificate.PublicKeyAlgorithm.String()),
+		KeyBits:        FindBitLength(certificate.PublicKey),
+		NotAfter:       certificate.NotAfter,
+		KeyUsage:       certificate.KeyUsage,
+		// ExtKeyUsage: We use ExtKeyUsageOIDs instead as the more general field
+		// ExtKeyUsageOIDs: this is an extension that may not be set, so is handled below
+		// PolicyIdentifiers: this is an extension that may not be set, so is handled below
+		BasicConstraintsValidForNonCA: certificate.BasicConstraintsValid,
+		SignatureBits:                 FindSignatureBits(certificate.SignatureAlgorithm),
+		UsePSS:                        IsPSS(certificate.SignatureAlgorithm),
+		// The following two values are on creation parameters, but are impossible to parse from the certificate
+		// ForceAppendCaChain
+		// UseCSRValues
+		PermittedDNSDomains:     certificate.PermittedDNSDomains,
+		ExcludedDNSDomains:      certificate.ExcludedDNSDomains,
+		PermittedIPRanges:       certificate.PermittedIPRanges,
+		ExcludedIPRanges:        certificate.ExcludedIPRanges,
+		PermittedEmailAddresses: certificate.PermittedEmailAddresses,
+		ExcludedEmailAddresses:  certificate.ExcludedEmailAddresses,
+		PermittedURIDomains:     certificate.PermittedURIDomains,
+		ExcludedURIDomains:      certificate.ExcludedURIDomains,
+
+		// URLs: punting on this for now
+		MaxPathLength:     certificate.MaxPathLen,
+		NotBeforeDuration: time.Now().Sub(certificate.NotBefore), // Assumes Certificate was created this moment
+		SKID:              certificate.SubjectKeyId,
+	}
+
+	extKeyUsageOIDS, err := getExtKeyUsageOids(certificate.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	creationParameters.ExtKeyUsageOIDs = extKeyUsageOIDS
+
+	policyInformationOids, err := getPolicyIdentifiers(certificate.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	creationParameters.PolicyIdentifiers = policyInformationOids
+
+	return creationParameters, err
+}
+
+func removeNames(name pkix.Name) pkix.Name {
+	name.Names = nil
+	return name
+}
+
+func ParseCsrToCreationParameters(csr x509.CertificateRequest) (CreationParameters, error) {
+	otherSANs, err := getOtherSANsMapFromExtensions(csr.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+
+	creationParameters := CreationParameters{
+		Subject:        removeNames(csr.Subject),
+		DNSNames:       csr.DNSNames,
+		EmailAddresses: csr.EmailAddresses,
+		IPAddresses:    csr.IPAddresses,
+		URIs:           csr.URIs,
+		OtherSANs:      otherSANs,
+		// IsCA: is handled below since the basic constraint it comes from might not be set on the CSR
+		KeyType: GetKeyType(csr.PublicKeyAlgorithm.String()),
+		KeyBits: FindBitLength(csr.PublicKey),
+		// NotAfter: this is not set on a CSR
+		// KeyUsage: handled below since this may not be set
+		// ExtKeyUsage: We use exclusively ExtKeyUsageOIDs here
+		// ExtKeyUsageOIDs: handled below since this may not be set
+		// PolicyIdentifiers: handled below since this may not be set
+		// BasicConstraintsValidForNonCA is handled below, since it may or may not be set on the CSR
+		SignatureBits: FindSignatureBits(csr.SignatureAlgorithm),
+		UsePSS:        IsPSS(csr.SignatureAlgorithm),
+		// The following two values are on creation parameters, but are impossible to parse from the csr
+		// ForceAppendCaChain
+		// UseCSRValues
+		// PermittedDNSDomains : omitted, this generally isn't on a CSR
+		// URLs : omitted, this generally isn't on a CSR
+		// MaxPathLength is handled below since the basic constraint it comes from may not be set on the CSR
+		// NotBeforeDuration : this is not set on a CSR
+		// SKID: this is generally not set on a CSR, but calculated from the Key information itself
+	}
+
+	keyUsage, err := getKeyUsage(csr.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	creationParameters.KeyUsage = keyUsage
+
+	extKeyUsageOIDS, err := getExtKeyUsageOids(csr.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	creationParameters.ExtKeyUsageOIDs = extKeyUsageOIDS
+
+	policyInformationOids, err := getPolicyIdentifiers(csr.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	creationParameters.PolicyIdentifiers = policyInformationOids
+
+	found, isCA, maxPathLength, err := getBasicConstraintsFromExtension(csr.Extensions)
+	if err != nil {
+		return CreationParameters{}, err
+	}
+	if found {
+		creationParameters.IsCA = isCA
+		creationParameters.BasicConstraintsValidForNonCA = (isCA && maxPathLength != 0) || (!isCA && (maxPathLength == 0))
+		if isCA { // MaxPathLength Only Has a Meaning on a Certificate Authority
+			creationParameters.MaxPathLength = maxPathLength
+		}
+	}
+
+	return creationParameters, err
+}
+
+func ParseCsrToFields(csr x509.CertificateRequest) (map[string]interface{}, error) {
+	otherSans, err := getOtherSANsStringFromExtensions(csr.Extensions)
+	if err != nil {
+		return nil, err
+	}
+
+	templateData := map[string]interface{}{
+		"common_name":          csr.Subject.CommonName,
+		"alt_names":            MakeAltNamesCommaSeparatedString(csr.DNSNames, csr.EmailAddresses),
+		"ip_sans":              MakeIpAddressCommaSeparatedString(csr.IPAddresses),
+		"uri_sans":             MakeUriCommaSeparatedString(csr.URIs),
+		"other_sans":           otherSans,
+		"signature_bits":       FindSignatureBits(csr.SignatureAlgorithm),
+		"exclude_cn_from_sans": DetermineExcludeCnFromCsrSans(csr),
+		"ou":                   makeCommaSeparatedString(csr.Subject.OrganizationalUnit),
+		"organization":         makeCommaSeparatedString(csr.Subject.Organization),
+		"country":              makeCommaSeparatedString(csr.Subject.Country),
+		"locality":             makeCommaSeparatedString(csr.Subject.Locality),
+		"province":             makeCommaSeparatedString(csr.Subject.Province),
+		"street_address":       makeCommaSeparatedString(csr.Subject.StreetAddress),
+		"postal_code":          makeCommaSeparatedString(csr.Subject.PostalCode),
+		"serial_number":        csr.Subject.SerialNumber,
+		// There is no "TTL" on a CSR, that is always set by the signer
+		// max_path_length is handled below
+		// permitted_dns_domains is a CA thing, it generally does not appear on a CSR
+		"use_pss": IsPSS(csr.SignatureAlgorithm),
+		// skid could be calculated, but does not directly exist on a csr, so punting for now
+		"key_type": GetKeyType(csr.PublicKeyAlgorithm.String()),
+		"key_bits": FindBitLength(csr.PublicKey),
+	}
+
+	// isCA is not a field in our data call - that is represented inside vault by using a different endpoint
+	found, _, _, err := getBasicConstraintsFromExtension(csr.Extensions)
+	if err != nil {
+		return nil, err
+	}
+	templateData["add_basic_constraints"] = found
+
+	return templateData, nil
+}
+
+func ParseCertificateToFields(certificate x509.Certificate) (map[string]interface{}, error) {
+	otherSans, err := getOtherSANsStringFromExtensions(certificate.Extensions)
+	if err != nil {
+		return nil, err
+	}
+
+	templateData := map[string]interface{}{
+		"common_name":               certificate.Subject.CommonName,
+		"alt_names":                 MakeAltNamesCommaSeparatedString(certificate.DNSNames, certificate.EmailAddresses),
+		"ip_sans":                   MakeIpAddressCommaSeparatedString(certificate.IPAddresses),
+		"uri_sans":                  MakeUriCommaSeparatedString(certificate.URIs),
+		"other_sans":                otherSans,
+		"signature_bits":            FindSignatureBits(certificate.SignatureAlgorithm),
+		"exclude_cn_from_sans":      DetermineExcludeCnFromCertSans(certificate),
+		"ou":                        makeCommaSeparatedString(certificate.Subject.OrganizationalUnit),
+		"organization":              makeCommaSeparatedString(certificate.Subject.Organization),
+		"country":                   makeCommaSeparatedString(certificate.Subject.Country),
+		"locality":                  makeCommaSeparatedString(certificate.Subject.Locality),
+		"province":                  makeCommaSeparatedString(certificate.Subject.Province),
+		"street_address":            makeCommaSeparatedString(certificate.Subject.StreetAddress),
+		"postal_code":               makeCommaSeparatedString(certificate.Subject.PostalCode),
+		"serial_number":             certificate.Subject.SerialNumber,
+		"ttl":                       (certificate.NotAfter.Sub(certificate.NotBefore)).String(),
+		"max_path_length":           certificate.MaxPathLen,
+		"permitted_dns_domains":     strings.Join(certificate.PermittedDNSDomains, ","),
+		"excluded_dns_domains":      strings.Join(certificate.ExcludedDNSDomains, ","),
+		"permitted_ip_ranges":       strings.Join(ipRangesToStrings(certificate.PermittedIPRanges), ","),
+		"excluded_ip_ranges":        strings.Join(ipRangesToStrings(certificate.ExcludedIPRanges), ","),
+		"permitted_email_addresses": strings.Join(certificate.PermittedEmailAddresses, ","),
+		"excluded_email_addresses":  strings.Join(certificate.ExcludedEmailAddresses, ","),
+		"permitted_uri_domains":     strings.Join(certificate.PermittedURIDomains, ","),
+		"excluded_uri_domains":      strings.Join(certificate.ExcludedURIDomains, ","),
+		"use_pss":                   IsPSS(certificate.SignatureAlgorithm),
+		"skid":                      hex.EncodeToString(certificate.SubjectKeyId),
+		"key_type":                  GetKeyType(certificate.PublicKeyAlgorithm.String()),
+		"key_bits":                  FindBitLength(certificate.PublicKey),
+	}
+
+	return templateData, nil
+}
+
+func ipRangesToStrings(ipRanges []*net.IPNet) []string {
+	var ret []string
+	for _, ipRange := range ipRanges {
+		ret = append(ret, ipRange.String())
+	}
+	return ret
+}
+
+func getBasicConstraintsFromExtension(exts []pkix.Extension) (found bool, isCA bool, maxPathLength int, err error) {
+	for _, ext := range exts {
+		if ext.Id.Equal(ExtensionBasicConstraintsOID) {
+			isCA, maxPathLength, err = ParseBasicConstraintExtension(ext)
+			if err != nil {
+				return false, false, -1, err
+			}
+			return true, isCA, maxPathLength, nil
+		}
+	}
+
+	return false, false, -1, nil
+}
+
+func MakeAltNamesCommaSeparatedString(names []string, emails []string) string {
+	return strings.Join(append(names, emails...), ",")
+}
+
+func MakeUriCommaSeparatedString(uris []*url.URL) string {
+	stringAddresses := make([]string, len(uris))
+	for i, uri := range uris {
+		stringAddresses[i] = uri.String()
+	}
+	return strings.Join(stringAddresses, ",")
+}
+
+func MakeIpAddressCommaSeparatedString(addresses []net.IP) string {
+	stringAddresses := make([]string, len(addresses))
+	for i, address := range addresses {
+		stringAddresses[i] = address.String()
+	}
+	return strings.Join(stringAddresses, ",")
+}
+
+func makeCommaSeparatedString(values []string) string {
+	return strings.Join(values, ",")
+}
+
+func DetermineExcludeCnFromCertSans(certificate x509.Certificate) bool {
+	cn := certificate.Subject.CommonName
+	if cn == "" {
+		return false
+	}
+
+	emails := certificate.EmailAddresses
+	for _, email := range emails {
+		if email == cn {
+			return false
+		}
+	}
+
+	dnses := certificate.DNSNames
+	for _, dns := range dnses {
+		if dns == cn {
+			return false
+		}
+	}
+
+	return true
+}
+
+func DetermineExcludeCnFromCsrSans(csr x509.CertificateRequest) bool {
+	cn := csr.Subject.CommonName
+	if cn == "" {
+		return false
+	}
+
+	emails := csr.EmailAddresses
+	for _, email := range emails {
+		if email == cn {
+			return false
+		}
+	}
+
+	dnses := csr.DNSNames
+	for _, dns := range dnses {
+		if dns == cn {
+			return false
+		}
+	}
+
+	return true
+}
+
+func FindBitLength(publicKey any) int {
+	if publicKey == nil {
+		return 0
+	}
+	switch pub := publicKey.(type) {
+	case *rsa.PublicKey:
+		return pub.N.BitLen()
+	case *ecdsa.PublicKey:
+		switch pub.Curve {
+		case elliptic.P224():
+			return 224
+		case elliptic.P256():
+			return 256
+		case elliptic.P384():
+			return 384
+		case elliptic.P521():
+			return 521
+		default:
+			return 0
+		}
+	default:
+		return 0
+	}
+}
+
+func FindSignatureBits(algo x509.SignatureAlgorithm) int {
+	switch algo {
+	case x509.MD2WithRSA, x509.MD5WithRSA, x509.SHA1WithRSA, x509.DSAWithSHA1, x509.ECDSAWithSHA1:
+		return -1
+	case x509.SHA256WithRSA, x509.DSAWithSHA256, x509.ECDSAWithSHA256, x509.SHA256WithRSAPSS:
+		return 256
+	case x509.SHA384WithRSA, x509.ECDSAWithSHA384, x509.SHA384WithRSAPSS:
+		return 384
+	case x509.SHA512WithRSA, x509.SHA512WithRSAPSS, x509.ECDSAWithSHA512:
+		return 512
+	case x509.PureEd25519:
+		return 0
+	default:
+		return -1
+	}
+}
+
+func GetKeyType(goKeyType string) string {
+	switch goKeyType {
+	case "RSA":
+		return "rsa"
+	case "ECDSA":
+		return "ec"
+	case "Ed25519":
+		return "ed25519"
+	default:
+		return ""
+	}
+}
+
+func IsPSS(algorithm x509.SignatureAlgorithm) bool {
+	switch algorithm {
+	case x509.SHA384WithRSAPSS, x509.SHA512WithRSAPSS, x509.SHA256WithRSAPSS:
+		return true
+	default:
+		return false
+	}
 }

@@ -1,17 +1,41 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
 import { set } from '@ember/object';
-import { hash, all } from 'rsvp';
+import { hash } from 'rsvp';
 import Route from '@ember/routing/route';
 import { supportedSecretBackends } from 'vault/helpers/supported-secret-backends';
-import { inject as service } from '@ember/service';
+import { allEngines, isAddonEngine, CONFIGURATION_ONLY } from 'vault/helpers/mountable-secret-engines';
+import { service } from '@ember/service';
 import { normalizePath } from 'vault/utils/path-encoding-helpers';
+import { assert } from '@ember/debug';
+import { pathIsDirectory } from 'kv/utils/kv-breadcrumbs';
 
 const SUPPORTED_BACKENDS = supportedSecretBackends();
 
+function getValidPage(pageParam) {
+  if (typeof pageParam === 'number') {
+    return pageParam;
+  }
+  if (typeof pageParam === 'string') {
+    try {
+      return parseInt(pageParam, 10) || 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+  return 1;
+}
+
 export default Route.extend({
+  pagination: service(),
+  store: service(),
   templateName: 'vault/cluster/secrets/backend/list',
   pathHelp: service('path-help'),
-  // By default assume user doesn't have permissions
-  noMetadataPermissions: true,
+  router: service(),
+
   queryParams: {
     page: {
       refreshModel: true,
@@ -36,55 +60,70 @@ export default Route.extend({
       case 'alphabet':
         modelType = 'transform/alphabet';
         break;
-      default:
-        modelType = 'transform'; // CBS TODO: transform/transformation
+      default: // CBS TODO: transform/transformation
+        modelType = 'transform';
         break;
     }
     return modelType;
   },
 
   secretParam() {
-    let { secret } = this.paramsFor(this.routeName);
+    const { secret } = this.paramsFor(this.routeName);
     return secret ? normalizePath(secret) : '';
   },
 
   enginePathParam() {
-    let { backend } = this.paramsFor('vault.cluster.secrets.backend');
+    const { backend } = this.paramsFor('vault.cluster.secrets.backend');
     return backend;
   },
 
   beforeModel() {
-    let secret = this.secretParam();
-    let backend = this.enginePathParam();
-    let { tab } = this.paramsFor('vault.cluster.secrets.backend.list-root');
-    let secretEngine = this.store.peekRecord('secret-engine', backend);
-    let type = secretEngine && secretEngine.get('engineType');
+    const secret = this.secretParam();
+    const backend = this.enginePathParam();
+    const { tab } = this.paramsFor('vault.cluster.secrets.backend.list-root');
+    const secretEngine = this.store.peekRecord('secret-engine', backend);
+    const type = secretEngine?.engineType;
+    assert('secretEngine.engineType is not defined', !!type);
+    // if configuration only, redirect to configuration route
+    if (CONFIGURATION_ONLY.includes(type)) {
+      return this.router.transitionTo('vault.cluster.secrets.backend.configuration', backend);
+    }
+
+    const engineRoute = allEngines().find((engine) => engine.type === type)?.engineRoute;
     if (!type || !SUPPORTED_BACKENDS.includes(type)) {
-      return this.transitionTo('vault.cluster.secrets');
+      return this.router.transitionTo('vault.cluster.secrets');
     }
     if (this.routeName === 'vault.cluster.secrets.backend.list' && !secret.endsWith('/')) {
-      return this.replaceWith('vault.cluster.secrets.backend.list', secret + '/');
+      return this.router.replaceWith('vault.cluster.secrets.backend.list', secret + '/');
     }
-    let modelType = this.getModelType(backend, tab);
-    return this.pathHelp.getNewModel(modelType, backend).then(() => {
+    if (isAddonEngine(type, secretEngine.version)) {
+      if (engineRoute === 'kv.list' && pathIsDirectory(secret)) {
+        return this.router.transitionTo('vault.cluster.secrets.backend.kv.list-directory', backend, secret);
+      }
+      return this.router.transitionTo(`vault.cluster.secrets.backend.${engineRoute}`, backend);
+    } else if (secretEngine.isV2KV) {
+      // if it's KV v2 but not registered as an addon, it's type generic
+      return this.router.transitionTo('vault.cluster.secrets.backend.kv.list', backend);
+    }
+    const modelType = this.getModelType(backend, tab);
+    return this.pathHelp.hydrateModel(modelType, backend).then(() => {
       this.store.unloadAll('capabilities');
     });
   },
 
   getModelType(backend, tab) {
-    let secretEngine = this.store.peekRecord('secret-engine', backend);
-    let type = secretEngine.get('engineType');
-    let types = {
+    const secretEngine = this.store.peekRecord('secret-engine', backend);
+    const type = secretEngine.engineType;
+    const types = {
       database: tab === 'role' ? 'database/role' : 'database/connection',
       transit: 'transit-key',
       ssh: 'role-ssh',
       transform: this.modelTypeForTransform(tab),
       aws: 'role-aws',
-      pki: tab === 'certs' ? 'pki-certificate' : 'role-pki',
-      // secret or secret-v2
       cubbyhole: 'secret',
-      kv: secretEngine.get('modelTypeForKV'),
-      generic: secretEngine.get('modelTypeForKV'),
+      kv: 'secret',
+      keymgmt: `keymgmt/${tab || 'key'}`,
+      generic: 'secret',
     };
     return types[type];
   },
@@ -97,25 +136,20 @@ export default Route.extend({
 
     return hash({
       secret,
-      secrets: this.store
+      secrets: this.pagination
         .lazyPaginatedQuery(modelType, {
           id: secret,
           backend,
           responsePath: 'data.keys',
-          page: params.page || 1,
+          page: getValidPage(params.page),
           pageFilter: params.pageFilter,
         })
         .then((model) => {
-          this.set('noMetadataPermissions', false);
           this.set('has404', false);
           return model;
         })
         .catch((err) => {
-          // if we're at the root we don't want to throw
-          if (backendModel && err.httpStatus === 404 && secret === '') {
-            return [];
-          } else if (backendModel.engineType === 'kv' && backendModel.isV2KV) {
-            this.set('noMetadataPermissions', true);
+          if (backendModel && err.httpStatus === 404) {
             return [];
           } else {
             // else we're throwing and dealing with this in the error action
@@ -125,50 +159,25 @@ export default Route.extend({
     });
   },
 
-  afterModel(model) {
-    const { tab } = this.paramsFor(this.routeName);
-    const backend = this.enginePathParam();
-    if (!tab || tab !== 'certs') {
-      return;
-    }
-    return all(
-      // these ids are treated specially by vault's api, but it's also
-      // possible that there is no certificate for them in order to know,
-      // we fetch them specifically on the list page, and then unload the
-      // records if there is no `certificate` attribute on the resultant model
-      ['ca', 'crl', 'ca_chain'].map((id) => this.store.queryRecord('pki-certificate', { id, backend }))
-    ).then(
-      (results) => {
-        results.rejectBy('certificate').forEach((record) => record.unloadRecord());
-        return model;
-      },
-      () => {
-        return model;
-      }
-    );
-  },
-
   setupController(controller, resolvedModel) {
-    let secretParams = this.paramsFor(this.routeName);
-    let secret = resolvedModel.secret;
-    let model = resolvedModel.secrets;
-    let backend = this.enginePathParam();
-    let backendModel = this.store.peekRecord('secret-engine', backend);
-    let has404 = this.has404;
-    let noMetadataPermissions = this.noMetadataPermissions;
+    const secretParams = this.paramsFor(this.routeName);
+    const secret = resolvedModel.secret;
+    const model = resolvedModel.secrets;
+    const backend = this.enginePathParam();
+    const backendModel = this.store.peekRecord('secret-engine', backend);
+    const has404 = this.has404;
     // only clear store cache if this is a new model
-    if (secret !== controller.get('baseKey.id')) {
-      this.store.clearAllDatasets();
+    if (secret !== controller?.baseKey?.id) {
+      this.pagination.clearDataset();
     }
     controller.set('hasModel', true);
     controller.setProperties({
       model,
       has404,
-      noMetadataPermissions,
       backend,
       backendModel,
       baseKey: { id: secret },
-      backendType: backendModel.get('engineType'),
+      backendType: backendModel.engineType,
     });
     if (!has404) {
       const pageFilter = secretParams.pageFilter;
@@ -195,18 +204,12 @@ export default Route.extend({
 
   actions: {
     error(error, transition) {
-      let secret = this.secretParam();
-      let backend = this.enginePathParam();
-      let is404 = error.httpStatus === 404;
+      const secret = this.secretParam();
+      const backend = this.enginePathParam();
+      const is404 = error.httpStatus === 404;
       /* eslint-disable-next-line ember/no-controller-access-in-routes */
-      let hasModel = this.controllerFor(this.routeName).get('hasModel');
+      const hasModel = this.controllerFor(this.routeName).hasModel;
 
-      // this will occur if we've deleted something,
-      // and navigate to its parent and the parent doesn't exist -
-      // this if often the case with nested keys in kv-like engines
-      if (transition.data.isDeletion && is404) {
-        throw error;
-      }
       set(error, 'secret', secret);
       set(error, 'isRoot', true);
       set(error, 'backend', backend);
@@ -222,12 +225,12 @@ export default Route.extend({
     willTransition(transition) {
       window.scrollTo(0, 0);
       if (transition.targetName !== this.routeName) {
-        this.store.clearAllDatasets();
+        this.pagination.clearDataset();
       }
       return true;
     },
     reload() {
-      this.store.clearAllDatasets();
+      this.pagination.clearDataset();
       this.refresh();
     },
   },

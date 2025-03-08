@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package vault
 
 import (
@@ -6,6 +9,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,13 +18,13 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
-	aeadwrapper "github.com/hashicorp/go-kms-wrapping/wrappers/aead"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/helper/metricregistry"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/hashicorp/vault/vault/seal"
@@ -41,7 +46,29 @@ const (
 	// leaderPrefixCleanDelay is how long to wait between deletions
 	// of orphaned leader keys, to prevent slamming the backend.
 	leaderPrefixCleanDelay = 200 * time.Millisecond
+
+	haAllowedMissedHeartbeats = 2
 )
+
+func init() {
+	// Register metrics that we should always consistently report whether or not
+	// they've been hit recently. The help texts are taken verbatim from our
+	// telemetry reference docs so if updated should probably stay in sync.
+	metricregistry.RegisterSummaries([]metricregistry.SummaryDefinition{
+		{
+			Name: []string{"core", "step_down"},
+			Help: "Time required to step down cluster leadership",
+		},
+		{
+			Name: []string{"core", "leadership_setup_failed"},
+			Help: "Time taken by the most recent leadership setup failure",
+		},
+		{
+			Name: []string{"core", "leadership_lost"},
+			Help: "Total time that a high-availability cluster node last maintained leadership",
+		},
+	})
+}
 
 var (
 	addEnterpriseHaActors func(*Core, *run.Group) chan func()            = addEnterpriseHaActorsNoop
@@ -62,6 +89,8 @@ func (c *Core) Standby() (bool, error) {
 }
 
 // PerfStandby checks if the vault is a performance standby
+// This function cannot be used during request handling
+// because this causes a deadlock with the statelock.
 func (c *Core) PerfStandby() bool {
 	c.stateLock.RLock()
 	perfStandby := c.perfStandby
@@ -86,7 +115,56 @@ func (c *Core) StandbyStates() (standby, perfStandby bool) {
 	return
 }
 
-// Leader is used to get the current active leader
+// getHAMembers retrieves cluster membership that doesn't depend on raft. This should only ever be called by the
+// active node.
+func (c *Core) getHAMembers() ([]HAStatusNode, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+
+	leader := HAStatusNode{
+		Hostname:       hostname,
+		APIAddress:     c.redirectAddr,
+		ClusterAddress: c.ClusterAddr(),
+		ActiveNode:     true,
+		Version:        c.effectiveSDKVersion,
+	}
+
+	if rb := c.getRaftBackend(); rb != nil {
+		leader.UpgradeVersion = rb.UpgradeVersion()
+		leader.RedundancyZone = rb.RedundancyZone()
+	}
+
+	nodes := []HAStatusNode{leader}
+
+	for _, peerNode := range c.GetHAPeerNodesCached() {
+		lastEcho := peerNode.LastEcho
+		nodes = append(nodes, HAStatusNode{
+			Hostname:                    peerNode.Hostname,
+			APIAddress:                  peerNode.APIAddress,
+			ClusterAddress:              peerNode.ClusterAddress,
+			LastEcho:                    &lastEcho,
+			Version:                     peerNode.Version,
+			UpgradeVersion:              peerNode.UpgradeVersion,
+			RedundancyZone:              peerNode.RedundancyZone,
+			EchoDurationMillis:          peerNode.EchoDuration.Milliseconds(),
+			ClockSkewMillis:             peerNode.ClockSkewMillis,
+			ReplicationPrimaryCanaryAge: peerNode.ReplicationPrimaryCanaryAge,
+		})
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].APIAddress < nodes[j].APIAddress
+	})
+
+	return nodes, nil
+}
+
+// Leader is used to get information about the current active leader in relation to the current node (core).
+// It utilizes a state lock on the Core by attempting to acquire a read lock. Care should be taken not to
+// call this method if a read lock on this Core's state lock is currently held, as this can cause deadlock.
+// e.g. if called from within request handling.
 func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err error) {
 	// Check if HA enabled. We don't need the lock for this check as it's set
 	// on startup and never modified
@@ -98,30 +176,41 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 	if c.Sealed() {
 		return false, "", "", consts.ErrSealed
 	}
-
 	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+
+	return c.LeaderLocked()
+}
+
+func (c *Core) LeaderLocked() (isLeader bool, leaderAddr, clusterAddr string, err error) {
+	// Check if HA enabled. We don't need the lock for this check as it's set
+	// on startup and never modified
+	if c.ha == nil {
+		return false, "", "", ErrHANotEnabled
+	}
+
+	// Check if sealed
+	if c.Sealed() {
+		return false, "", "", consts.ErrSealed
+	}
 
 	// Check if we are the leader
 	if !c.standby {
-		c.stateLock.RUnlock()
 		return true, c.redirectAddr, c.ClusterAddr(), nil
 	}
 
 	// Initialize a lock
 	lock, err := c.ha.LockWith(CoreLockPath, "read")
 	if err != nil {
-		c.stateLock.RUnlock()
 		return false, "", "", err
 	}
 
 	// Read the value
 	held, leaderUUID, err := lock.Value()
 	if err != nil {
-		c.stateLock.RUnlock()
 		return false, "", "", err
 	}
 	if !held {
-		c.stateLock.RUnlock()
 		return false, "", "", nil
 	}
 
@@ -136,13 +225,11 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 	// If the leader hasn't changed, return the cached value; nothing changes
 	// mid-leadership, and the barrier caches anyways
 	if leaderUUID == localLeaderUUID && localRedirectAddr != "" {
-		c.stateLock.RUnlock()
 		return false, localRedirectAddr, localClusterAddr, nil
 	}
 
 	c.logger.Trace("found new active node information, refreshing")
 
-	defer c.stateLock.RUnlock()
 	c.leaderParamsLock.Lock()
 	defer c.leaderParamsLock.Unlock()
 
@@ -181,6 +268,15 @@ func (c *Core) Leader() (isLeader bool, leaderAddr, clusterAddr string, err erro
 		adv.RedirectAddr = string(entry.Value)
 		c.logger.Debug("parsed redirect addr for new active node", "redirect_addr", adv.RedirectAddr)
 		oldAdv = true
+	}
+
+	// At the top of this function we return early when we're the active node.
+	// If we're not the active node, and there's a stale advertisement pointing
+	// to ourself, there's no point in paying any attention to it.  And by
+	// disregarding it, we can avoid a panic in raft tests using the Inmem network
+	// layer when we try to connect back to ourself.
+	if adv.ClusterAddr == c.ClusterAddr() && adv.RedirectAddr == c.redirectAddr && c.getRaftBackend() != nil {
+		return false, "", "", nil
 	}
 
 	if !oldAdv {
@@ -275,7 +371,7 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 		Auth:    auth,
 		Request: req,
 	}
-	if err := c.auditBroker.LogRequest(ctx, logInput, c.auditedHeaders); err != nil {
+	if err := c.auditBroker.LogRequest(ctx, logInput); err != nil {
 		c.logger.Error("failed to audit request", "request_path", req.Path, "error", err)
 		return errors.New("failed to audit request, cannot continue")
 	}
@@ -379,6 +475,17 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 		})
 	}
 	{
+		metricsStop := make(chan struct{})
+
+		g.Add(func() error {
+			c.metricsLoop(metricsStop)
+			return nil
+		}, func(error) {
+			close(metricsStop)
+			c.logger.Debug("shutting down periodic metrics")
+		})
+	}
+	{
 		// Wait for leadership
 		leaderStopCh := make(chan struct{})
 
@@ -448,6 +555,20 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			continue
 		}
 
+		// If the backend is a FencingHABackend, register the lock with it so it can
+		// correctly fence all writes from now on  (i.e. assert that we still hold
+		// the lock atomically with each write).
+		if fba, ok := c.ha.(physical.FencingHABackend); ok {
+			err := fba.RegisterActiveNodeLock(lock)
+			if err != nil {
+				// Can't register lock, bail out
+				c.heldHALock = nil
+				lock.Unlock()
+				c.logger.Error("failed registering lock with fencing backend, giving up active state")
+				continue
+			}
+		}
+
 		c.logger.Info("acquired lock, enabling active operation")
 
 		// This is used later to log a metrics event; this can be helpful to
@@ -457,7 +578,9 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		continueCh := interruptPerfStandby(newLeaderCh, stopCh)
 
 		// Grab the statelock or stop
-		if stopped := grabLockOrStop(c.stateLock.Lock, c.stateLock.Unlock, stopCh); stopped {
+		l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
+		go l.grab()
+		if stopped := l.lockOrStop(); stopped {
 			lock.Unlock()
 			close(continueCh)
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
@@ -481,6 +604,20 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		c.activeContext = activeCtx
 		c.activeContextCancelFunc.Store(activeCtxCancel)
 
+		// Trigger a seal reload if necessary. A seal reload is necessary when a node
+		// becomes the leader since its seal generation information may be out of
+		// date (as is the case, for example, when a new node joins the cluster).
+		if err := c.TriggerSealReload(c.activeContext); err != nil {
+			c.logger.Error("seal configuration reload error", "error", err)
+			c.barrier.Seal()
+			c.logger.Warn("vault is sealed")
+			c.heldHALock = nil
+			lock.Unlock()
+			close(continueCh)
+			c.stateLock.Unlock()
+			return
+		}
+
 		// Perform seal migration
 		if err := c.migrateSeal(c.activeContext); err != nil {
 			c.logger.Error("seal migration error", "error", err)
@@ -497,9 +634,9 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		// everything is sane. If we have no sanity in the barrier, we actually
 		// seal, as there's little we can do.
 		{
-			c.seal.SetBarrierConfig(activeCtx, nil)
+			c.seal.ClearBarrierConfig(activeCtx)
 			if c.seal.RecoveryKeySupported() {
-				c.seal.SetRecoveryConfig(activeCtx, nil)
+				c.seal.ClearRecoveryConfig(activeCtx)
 			}
 
 			if err := c.performKeyUpgrades(activeCtx); err != nil {
@@ -564,6 +701,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		err = c.postUnseal(activeCtx, activeCtxCancel, standardUnsealStrategy{})
 		if err == nil {
 			c.standby = false
+			c.activeTime = time.Now()
 			c.leaderUUID = uuid
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 1, nil)
 		}
@@ -594,16 +732,20 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			// Spawn this in a go routine so we can cancel the context and
 			// unblock any inflight requests that are holding the statelock.
 			go func() {
+				timer := time.NewTimer(DefaultMaxRequestDuration)
 				select {
 				case <-activeCtx.Done():
-				// Attempt to drain any inflight requests
-				case <-time.After(DefaultMaxRequestDuration):
+					timer.Stop()
+					// Attempt to drain any inflight requests
+				case <-timer.C:
 					activeCtxCancel()
 				}
 			}()
 
 			// Grab lock if we are not stopped
-			stopped := grabLockOrStop(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
+			l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
+			go l.grab()
+			stopped := l.lockOrStop()
 
 			// Cancel the context incase the above go routine hasn't done it
 			// yet
@@ -612,6 +754,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 			// Mark as standby
 			c.standby = true
+			c.activeTime = time.Time{}
 			c.leaderUUID = ""
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 0, nil)
 
@@ -632,6 +775,13 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 				c.heldHALock = nil
 			}
 
+			// Advertise ourselves as a standby.
+			if c.serviceRegistration != nil {
+				if err := c.serviceRegistration.NotifyActiveStateChange(false); err != nil {
+					c.logger.Warn("failed to notify standby status", "error", err)
+				}
+			}
+
 			// If we are stopped return, otherwise unlock the statelock
 			if stopped {
 				return
@@ -646,46 +796,74 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 // lock was acquired (stopped=false) then it's up to the caller to unlock. If
 // the lock was not acquired (stopped=true), the caller does not hold the lock and
 // should not call unlock.
+// It's probably better to inline the body of grabLockOrStop into your function
+// instead of calling it. If multiple functions call grabLockOrStop, when a deadlock
+// occurs, we have no way of knowing who launched the grab goroutine, complicating
+// investigation.
 func grabLockOrStop(lockFunc, unlockFunc func(), stopCh chan struct{}) (stopped bool) {
-	// lock protects these variables which are shared by parent and child.
-	var lock sync.Mutex
-	parentWaiting := true
-	locked := false
+	l := newLockGrabber(lockFunc, unlockFunc, stopCh)
+	go l.grab()
+	return l.lockOrStop()
+}
 
+type lockGrabber struct {
+	// stopCh provides a way to interrupt the grab-or-stop
+	stopCh chan struct{}
 	// doneCh is closed when the child goroutine is done.
-	doneCh := make(chan struct{})
-	go func() {
-		defer close(doneCh)
-		lockFunc()
+	doneCh     chan struct{}
+	lockFunc   func()
+	unlockFunc func()
+	// lock protects these variables which are shared by parent and child.
+	lock          sync.Mutex
+	parentWaiting bool
+	locked        bool
+}
 
-		// The parent goroutine may or may not be waiting.
-		lock.Lock()
-		defer lock.Unlock()
-		if !parentWaiting {
-			unlockFunc()
-		} else {
-			locked = true
-		}
-	}()
+func newLockGrabber(lockFunc, unlockFunc func(), stopCh chan struct{}) *lockGrabber {
+	return &lockGrabber{
+		doneCh:        make(chan struct{}),
+		lockFunc:      lockFunc,
+		unlockFunc:    unlockFunc,
+		parentWaiting: true,
+		stopCh:        stopCh,
+	}
+}
 
+// lockOrStop waits for grab to get a lock or give up, see grabLockOrStop for how to use it.
+func (l *lockGrabber) lockOrStop() (stopped bool) {
 	stop := false
 	select {
-	case <-stopCh:
+	case <-l.stopCh:
 		stop = true
-	case <-doneCh:
+	case <-l.doneCh:
 	}
 
 	// The child goroutine may not have acquired the lock yet.
-	lock.Lock()
-	defer lock.Unlock()
-	parentWaiting = false
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	l.parentWaiting = false
 	if stop {
-		if locked {
-			unlockFunc()
+		if l.locked {
+			l.unlockFunc()
 		}
 		return true
 	}
 	return false
+}
+
+// grab tries to get a lock, see grabLockOrStop for how to use it.
+func (l *lockGrabber) grab() {
+	defer close(l.doneCh)
+	l.lockFunc()
+
+	// The parent goroutine may or may not be waiting.
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	if !l.parentWaiting {
+		l.unlockFunc()
+	} else {
+		l.locked = true
+	}
 }
 
 // This checks the leader periodically to ensure that we switch RPC to a new
@@ -697,8 +875,9 @@ func (c *Core) periodicLeaderRefresh(newLeaderCh chan func(), stopCh chan struct
 
 	clusterAddr := ""
 	for {
+		timer := time.NewTimer(c.periodicLeaderRefreshInterval)
 		select {
-		case <-time.After(leaderCheckInterval):
+		case <-timer.C:
 			count := atomic.AddInt32(opCount, 1)
 			if count > 1 {
 				atomic.AddInt32(opCount, -1)
@@ -711,7 +890,18 @@ func (c *Core) periodicLeaderRefresh(newLeaderCh chan func(), stopCh chan struct
 			go func() {
 				// Bind locally, as the race detector is tripping here
 				lopCount := opCount
-				isLeader, _, newClusterAddr, _ := c.Leader()
+				isLeader, _, newClusterAddr, err := c.Leader()
+				if err != nil {
+					// This is debug level because it's not really something the user
+					// needs to see typically. This will only really fail if we are sealed
+					// or the HALock fails (e.g. can't connect to Consul or elect raft
+					// leader) and other things in logs should make those kinds of
+					// conditions obvious. However when debugging, it is useful to know
+					// for sure why a standby is not seeing the leadership update which
+					// could be due to errors being returned or could be due to some other
+					// bug.
+					c.logger.Debug("periodicLeaderRefresh fail to fetch leader info", "err", err)
+				}
 
 				// If we are the leader reset the clusterAddr since the next
 				// failover might go to the node that was previously active.
@@ -731,6 +921,7 @@ func (c *Core) periodicLeaderRefresh(newLeaderCh chan func(), stopCh chan struct
 				atomic.AddInt32(lopCount, -1)
 			}()
 		case <-stopCh:
+			timer.Stop()
 			return
 		}
 	}
@@ -743,8 +934,9 @@ func (c *Core) periodicCheckKeyUpgrades(ctx context.Context, stopCh chan struct{
 
 	opCount := new(int32)
 	for {
+		timer := time.NewTimer(keyRotateCheckInterval)
 		select {
-		case <-time.After(keyRotateCheckInterval):
+		case <-timer.C:
 			count := atomic.AddInt32(opCount, 1)
 			if count > 1 {
 				atomic.AddInt32(opCount, -1)
@@ -768,7 +960,8 @@ func (c *Core) periodicCheckKeyUpgrades(ctx context.Context, stopCh chan struct{
 				// keys (e.g. from replication being activated) and we need to seal to
 				// be unsealed again.
 				entry, _ := c.barrier.Get(ctx, poisonPillPath)
-				if entry != nil && len(entry.Value) > 0 {
+				entryDR, _ := c.barrier.Get(ctx, poisonPillDRPath)
+				if (entry != nil && len(entry.Value) > 0) || (entryDR != nil && len(entryDR.Value) > 0) {
 					c.logger.Warn("encryption keys have changed out from underneath us (possibly due to replication enabling), must be unsealed again")
 					// If we are using raft storage we do not want to shut down
 					// raft during replication secondary enablement. This will
@@ -799,6 +992,7 @@ func (c *Core) periodicCheckKeyUpgrades(ctx context.Context, stopCh chan struct{
 				return
 			}()
 		case <-stopCh:
+			timer.Stop()
 			return
 		}
 	}
@@ -833,10 +1027,13 @@ func (c *Core) reloadRootKey(ctx context.Context) error {
 }
 
 func (c *Core) reloadShamirKey(ctx context.Context) error {
-	_ = c.seal.SetBarrierConfig(ctx, nil)
-	if cfg, _ := c.seal.BarrierConfig(ctx); cfg == nil {
+	_ = c.seal.ClearBarrierConfig(ctx)
+
+	cfg, _ := c.seal.BarrierConfig(ctx)
+	if cfg == nil {
 		return nil
 	}
+
 	var shamirKey []byte
 	switch c.seal.StoredKeysSupported() {
 	case seal.StoredKeysSupportedGeneric:
@@ -857,7 +1054,7 @@ func (c *Core) reloadShamirKey(ctx context.Context) error {
 		}
 		shamirKey = keyring.rootKey
 	}
-	return c.seal.GetAccess().Wrapper.(*aeadwrapper.ShamirWrapper).SetAESGCMKeyBytes(shamirKey)
+	return c.seal.GetAccess().SetShamirSealKey(shamirKey)
 }
 
 func (c *Core) performKeyUpgrades(ctx context.Context) error {
@@ -930,9 +1127,11 @@ func (c *Core) acquireLock(lock physical.Lock, stopCh <-chan struct{}) <-chan st
 
 		// Retry the acquisition
 		c.logger.Error("failed to acquire lock", "error", err)
+		timer := time.NewTimer(lockRetryInterval)
 		select {
-		case <-time.After(lockRetryInterval):
+		case <-timer.C:
 		case <-stopCh:
+			timer.Stop()
 			return nil
 		}
 	}
@@ -999,13 +1198,15 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh 
 		return
 	}
 	for len(keys) > 0 {
+		timer := time.NewTimer(leaderPrefixCleanDelay)
 		select {
-		case <-time.After(leaderPrefixCleanDelay):
+		case <-timer.C:
 			if keys[0] != uuid {
 				c.barrier.Delete(ctx, coreLeaderPrefix+keys[0])
 			}
 			keys = keys[1:]
 		case <-leaderLostCh:
+			timer.Stop()
 			return
 		}
 	}
@@ -1014,18 +1215,7 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh 
 // clearLeader is used to clear our leadership entry
 func (c *Core) clearLeader(uuid string) error {
 	key := coreLeaderPrefix + uuid
-	err := c.barrier.Delete(context.Background(), key)
-
-	// Advertise ourselves as a standby
-	if c.serviceRegistration != nil {
-		if err := c.serviceRegistration.NotifyActiveStateChange(false); err != nil {
-			if c.logger.IsWarn() {
-				c.logger.Warn("failed to notify standby status", "error", err)
-			}
-		}
-	}
-
-	return err
+	return c.barrier.Delete(context.Background(), key)
 }
 
 func (c *Core) SetNeverBecomeActive(on bool) {
@@ -1034,4 +1224,38 @@ func (c *Core) SetNeverBecomeActive(on bool) {
 	} else {
 		atomic.StoreUint32(c.neverBecomeActive, 0)
 	}
+}
+
+func (c *Core) getRemovableHABackend() physical.RemovableNodeHABackend {
+	var haBackend physical.RemovableNodeHABackend
+	if removableHA, ok := c.ha.(physical.RemovableNodeHABackend); ok {
+		haBackend = removableHA
+	}
+
+	if removableHA, ok := c.underlyingPhysical.(physical.RemovableNodeHABackend); ok {
+		haBackend = removableHA
+	}
+
+	return haBackend
+}
+
+// GetHAHeartbeatHealth returns whether a node's last successful heartbeat was
+// more than 2 intervals ago. If the node's request forwarding clients were
+// cleared (due to the node being sealed or finding a new leader), or the node
+// is uninitialized, healthy will be false.
+func (c *Core) GetHAHeartbeatHealth() (healthy bool, sinceLastHeartbeat *time.Duration) {
+	heartbeat := c.rpcLastSuccessfulHeartbeat.Load()
+	if heartbeat == nil {
+		return false, nil
+	}
+	lastHeartbeat := heartbeat.(time.Time)
+	if lastHeartbeat.IsZero() {
+		return false, nil
+	}
+	diff := time.Now().Sub(lastHeartbeat)
+	heartbeatInterval := c.clusterHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 5 * time.Second
+	}
+	return diff < heartbeatInterval*haAllowedMissedHeartbeats, &diff
 }

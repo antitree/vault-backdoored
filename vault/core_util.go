@@ -1,17 +1,24 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 //go:build !enterprise
 
 package vault
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/hashicorp/vault/command/server"
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/helper/activationflags"
 	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/limits"
 	"github.com/hashicorp/vault/sdk/helper/license"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/hashicorp/vault/vault/quotas"
 	"github.com/hashicorp/vault/vault/replication"
+	uicustommessages "github.com/hashicorp/vault/vault/ui_custom_messages"
 )
 
 const (
@@ -21,11 +28,11 @@ const (
 
 type (
 	entCore       struct{}
-	entCoreConfig struct{}
+	EntCoreConfig struct{}
 )
 
-func (e entCoreConfig) Clone() entCoreConfig {
-	return entCoreConfig{}
+func (e EntCoreConfig) Clone() EntCoreConfig {
+	return EntCoreConfig{}
 }
 
 type LicensingConfig struct {
@@ -52,6 +59,9 @@ func coreInit(c *Core, conf *CoreConfig) error {
 	if !conf.DisableKeyEncodingChecks {
 		c.physical = physical.NewStorageEncoding(c.physical)
 	}
+
+	c.FeatureActivationFlags = activationflags.NewFeatureActivationFlags()
+
 	return nil
 }
 
@@ -59,22 +69,33 @@ func (c *Core) setupReplicationResolverHandler() error {
 	return nil
 }
 
-// GetCoreConfigInternal returns the server configuration
-// in struct format.
-func (c *Core) GetCoreConfigInternal() *server.Config {
-	conf := c.rawConfig.Load()
-	if conf == nil {
-		return nil
+func NewPolicyMFABackend(core *Core, logger hclog.Logger) *PolicyMFABackend { return nil }
+
+func (c *Core) barrierViewForNamespace(namespaceId string) (*BarrierView, error) {
+	if namespaceId != namespace.RootNamespaceID {
+		return nil, fmt.Errorf("failed to find barrier view for non-root namespace")
 	}
-	return conf.(*server.Config)
+
+	return c.systemBarrierView, nil
 }
 
+func (c *Core) UndoLogsEnabled() bool            { return false }
+func (c *Core) UndoLogsPersisted() (bool, error) { return false, nil }
+func (c *Core) EnableUndoLogs()                  {}
+func (c *Core) PersistUndoLogs() error           { return nil }
+
+func (c *Core) ReindexStage() *uint32  { return nil }
+func (c *Core) BuildProgress() *uint32 { return nil }
+func (c *Core) BuildTotal() *uint32    { return nil }
+
 func (c *Core) teardownReplicationResolverHandler() {}
-func createSecondaries(*Core, *CoreConfig)          {}
+func (c *Core) createSecondaries(_ hclog.Logger)    {}
 
-func addExtraLogicalBackends(*Core, map[string]logical.Factory) {}
+func (c *Core) addExtraLogicalBackends(_ string) {}
 
-func addExtraCredentialBackends(*Core, map[string]logical.Factory) {}
+func (c *Core) addExtraEventBackends() {}
+
+func (c *Core) addExtraCredentialBackends() {}
 
 func preUnsealInternal(context.Context, *Core) error { return nil }
 
@@ -103,7 +124,7 @@ func postUnsealPhysical(c *Core) error {
 	return nil
 }
 
-func loadMFAConfigs(context.Context, *Core) error { return nil }
+func loadPolicyMFAConfigs(context.Context, *Core) error { return nil }
 
 func shouldStartClusterListener(*Core) bool { return true }
 
@@ -123,8 +144,8 @@ func (c *Core) collectNamespaces() []*namespace.Namespace {
 	}
 }
 
-func (c *Core) namepaceByPath(string) *namespace.Namespace {
-	return namespace.RootNamespace
+func (c *Core) HasWALState(required *logical.WALState, perfStandby bool) bool {
+	return true
 }
 
 func (c *Core) setupReplicatedClusterPrimary(*replication.Cluster) error { return nil }
@@ -165,7 +186,7 @@ func (c *Core) quotaLeaseWalker(ctx context.Context, callback func(request *quot
 	return nil
 }
 
-func (c *Core) quotasHandleLeases(ctx context.Context, action quotas.LeaseAction, leaseIDs []string) error {
+func (c *Core) quotasHandleLeases(ctx context.Context, action quotas.LeaseAction, leases []*quotas.QuotaLeaseInformation) error {
 	return nil
 }
 
@@ -177,6 +198,10 @@ func (c *Core) AllowForwardingViaHeader() bool {
 	return false
 }
 
+func (c *Core) ForwardToActive() string {
+	return ""
+}
+
 func (c *Core) MissingRequiredState(raw []string, perfStandby bool) bool {
 	return false
 }
@@ -184,3 +209,19 @@ func (c *Core) MissingRequiredState(raw []string, perfStandby bool) bool {
 func DiagnoseCheckLicense(ctx context.Context, vaultCore *Core, coreConfig CoreConfig, generate bool) (bool, []string) {
 	return false, nil
 }
+
+// createCustomMessageManager is a function implemented differently for the
+// community edition and the enterprise edition. This is the community
+// edition implementation. It simply constructs a uicustommessages.Manager
+// instance and returns a pointer to it.
+func createCustomMessageManager(storage logical.Storage, _ *Core) CustomMessagesManager {
+	return uicustommessages.NewManager(storage)
+}
+
+// GetRequestLimiter is a stub for CE. The caller will handle the nil case as a no-op.
+func (c *Core) GetRequestLimiter(key string) *limits.RequestLimiter {
+	return nil
+}
+
+// ReloadRequestLimiter is a no-op on CE.
+func (c *Core) ReloadRequestLimiter() {}

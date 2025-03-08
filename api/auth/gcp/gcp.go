@@ -1,10 +1,13 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package gcp
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -67,6 +70,10 @@ func NewGCPAuth(roleName string, opts ...LoginOption) (*GCPAuth, error) {
 // endpoint, and performs a write to it. This method defaults to the "gce"
 // auth type unless NewGCPAuth is called with WithIAMAuth().
 func (a *GCPAuth) Login(ctx context.Context, client *api.Client) (*api.Secret, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	loginData := map[string]interface{}{
 		"role": a.roleName,
 	}
@@ -86,7 +93,7 @@ func (a *GCPAuth) Login(ctx context.Context, client *api.Client) (*api.Secret, e
 	}
 
 	path := fmt.Sprintf("auth/%s/login", a.mountPath)
-	resp, err := client.Logical().Write(path, loginData)
+	resp, err := client.Logical().WriteWithContext(ctx, path, loginData)
 	if err != nil {
 		return nil, fmt.Errorf("unable to log in with GCP auth: %w", err)
 	}
@@ -174,7 +181,7 @@ func (a *GCPAuth) getJWTFromMetadataService(vaultAddress string) (string, error)
 	defer resp.Body.Close()
 
 	// get jwt from response
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	jwt := string(body)
 	if err != nil {
 		return "", fmt.Errorf("error reading response from metadata service: %w", err)

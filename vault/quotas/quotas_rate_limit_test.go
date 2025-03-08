@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package quotas
 
 import (
@@ -11,6 +14,7 @@ import (
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/helper/metricsutil"
 	"github.com/hashicorp/vault/sdk/helper/logging"
+	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"go.uber.org/goleak"
@@ -27,7 +31,7 @@ func TestNewRateLimitQuota(t *testing.T) {
 		rlq       *RateLimitQuota
 		expectErr bool
 	}{
-		{"valid rate", NewRateLimitQuota("test-rate-limiter", "qa", "/foo/bar", 16.7, time.Second, 0), false},
+		{"valid rate", NewRateLimitQuota("test-rate-limiter", "qa", "/foo/bar", "", "", false, time.Second, 0, 16.7), false},
 	}
 
 	for _, tc := range testCases {
@@ -44,7 +48,7 @@ func TestNewRateLimitQuota(t *testing.T) {
 }
 
 func TestRateLimitQuota_Close(t *testing.T) {
-	rlq := NewRateLimitQuota("test-rate-limiter", "qa", "/foo/bar", 16.7, time.Second, time.Minute)
+	rlq := NewRateLimitQuota("test-rate-limiter", "qa", "/foo/bar", "", "", false, time.Second, time.Minute, 16.7)
 	require.NoError(t, rlq.initialize(logging.NewVaultLogger(log.Trace), metricsutil.BlackholeSink()))
 	require.NoError(t, rlq.close(context.Background()))
 
@@ -70,41 +74,42 @@ func TestRateLimitQuota_Allow(t *testing.T) {
 
 	var wg sync.WaitGroup
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	reqFunc := func(addr string, atomicNumAllow, atomicNumFail *atomic.Int32) {
 		defer wg.Done()
 
-		resp, err := rlq.allow(context.Background(), &Request{ClientAddress: addr})
-		if err != nil {
-			return
-		}
+		for ctx.Err() == nil {
+			resp, err := rlq.allow(context.Background(), &Request{ClientAddress: addr})
+			if err != nil {
+				return
+			}
 
-		if resp.Allowed {
-			atomicNumAllow.Add(1)
-		} else {
-			atomicNumFail.Add(1)
+			if resp.Allowed {
+				atomicNumAllow.Add(1)
+			} else {
+				atomicNumFail.Add(1)
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 
 	results := make(map[string]*clientResult)
 
 	start := time.Now()
-	end := start.Add(5 * time.Second)
 
-	for time.Now().Before(end) {
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
 
-			addr := fmt.Sprintf("127.0.0.%d", i)
-			cr, ok := results[addr]
-			if !ok {
-				results[addr] = &clientResult{atomicNumAllow: atomic.NewInt32(0), atomicNumFail: atomic.NewInt32(0)}
-				cr = results[addr]
-			}
-
-			go reqFunc(addr, cr.atomicNumAllow, cr.atomicNumFail)
-
-			time.Sleep(2 * time.Millisecond)
+		addr := fmt.Sprintf("127.0.0.%d", i)
+		cr, ok := results[addr]
+		if !ok {
+			results[addr] = &clientResult{atomicNumAllow: atomic.NewInt32(0), atomicNumFail: atomic.NewInt32(0)}
+			cr = results[addr]
 		}
+
+		go reqFunc(addr, cr.atomicNumAllow, cr.atomicNumFail)
 	}
 
 	wg.Wait()
@@ -118,11 +123,11 @@ func TestRateLimitQuota_Allow(t *testing.T) {
 		numFail := cr.atomicNumFail.Load()
 
 		// ensure there were some failed requests for the namespace
-		require.NotZerof(t, numFail, "expected some requests to fail; addr: %s, numSuccess: %d, numFail: %d, elapsed: %d", addr, numAllow, numFail, elapsed)
+		require.NotZerof(t, numFail, "expected some requests to fail; addr: %s, numSuccess: %d, numFail: %d, elapsed: %s", addr, numAllow, numFail, elapsed)
 
 		// ensure that we should never get more requests than allowed for the namespace
 		want := int32(ideal + 1)
-		require.Falsef(t, numAllow > want, "too many successful requests; addr: %s, want: %d, numSuccess: %d, numFail: %d, elapsed: %d", addr, want, numAllow, numFail, elapsed)
+		require.Falsef(t, numAllow > want, "too many successful requests; addr: %s, want: %d, numSuccess: %d, numFail: %d, elapsed: %s", addr, want, numAllow, numFail, elapsed)
 	}
 }
 
@@ -133,6 +138,7 @@ func TestRateLimitQuota_Allow_WithBlock(t *testing.T) {
 		NamespacePath: "qa",
 		MountPath:     "/foo/bar",
 		Rate:          16.7,
+		Interval:      5 * time.Second,
 		BlockInterval: 10 * time.Second,
 
 		// override values to lower durations for testing purposes
@@ -146,41 +152,40 @@ func TestRateLimitQuota_Allow_WithBlock(t *testing.T) {
 
 	var wg sync.WaitGroup
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	reqFunc := func(addr string, atomicNumAllow, atomicNumFail *atomic.Int32) {
 		defer wg.Done()
 
-		resp, err := rlq.allow(context.Background(), &Request{ClientAddress: addr})
-		if err != nil {
-			return
-		}
+		for ctx.Err() == nil {
+			resp, err := rlq.allow(ctx, &Request{ClientAddress: addr})
+			if err != nil {
+				return
+			}
 
-		if resp.Allowed {
-			atomicNumAllow.Add(1)
-		} else {
-			atomicNumFail.Add(1)
+			if resp.Allowed {
+				atomicNumAllow.Add(1)
+			} else {
+				atomicNumFail.Add(1)
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 
 	results := make(map[string]*clientResult)
 
-	start := time.Now()
-	end := start.Add(5 * time.Second)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
 
-	for time.Now().Before(end) {
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
-
-			addr := fmt.Sprintf("127.0.0.%d", i)
-			cr, ok := results[addr]
-			if !ok {
-				results[addr] = &clientResult{atomicNumAllow: atomic.NewInt32(0), atomicNumFail: atomic.NewInt32(0)}
-				cr = results[addr]
-			}
-
-			go reqFunc(addr, cr.atomicNumAllow, cr.atomicNumFail)
-
-			time.Sleep(2 * time.Millisecond)
+		addr := fmt.Sprintf("127.0.0.%d", i)
+		cr, ok := results[addr]
+		if !ok {
+			results[addr] = &clientResult{atomicNumAllow: atomic.NewInt32(0), atomicNumFail: atomic.NewInt32(0)}
+			cr = results[addr]
 		}
+
+		go reqFunc(addr, cr.atomicNumAllow, cr.atomicNumFail)
 	}
 
 	wg.Wait()
@@ -191,7 +196,7 @@ func TestRateLimitQuota_Allow_WithBlock(t *testing.T) {
 
 		// Since blocking is enabled, each client should only have 'rate' successful
 		// requests, whereas all subsequent requests fail.
-		require.Equal(t, int32(17), numAllow)
+		require.Equal(t, int32(17), numAllow, "Expected 17 got %d allows with %d failures", numAllow, numFail)
 		require.NotZero(t, numFail)
 	}
 
@@ -214,10 +219,13 @@ func TestRateLimitQuota_Allow_WithBlock(t *testing.T) {
 
 func TestRateLimitQuota_Update(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	qm, err := NewManager(logging.NewVaultLogger(log.Trace), nil, metricsutil.BlackholeSink())
+	qm, err := NewManager(logging.NewVaultLogger(log.Trace), nil, metricsutil.BlackholeSink(), true)
 	require.NoError(t, err)
 
-	quota := NewRateLimitQuota("quota1", "", "", 10, time.Second, 0)
+	view := &logical.InmemStorage{}
+	require.NoError(t, qm.Setup(context.Background(), view, nil))
+
+	quota := NewRateLimitQuota("quota1", "", "", "", "", false, time.Second, 0, 10)
 	require.NoError(t, qm.SetQuota(context.Background(), TypeRateLimit.String(), quota, true))
 	require.NoError(t, qm.SetQuota(context.Background(), TypeRateLimit.String(), quota, true))
 

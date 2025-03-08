@@ -1,205 +1,274 @@
-import Model, { attr } from '@ember-data/model';
-import { computed } from '@ember/object';
-import { fragment } from 'ember-data-model-fragments/attributes';
-import fieldToAttrs, { expandAttributeMeta } from 'vault/utils/field-to-attrs';
-import { validator, buildValidations } from 'ember-cp-validations';
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Model, { attr, belongsTo } from '@ember-data/model';
+import { computed } from '@ember/object'; // eslint-disable-line
+import { equal } from '@ember/object/computed'; // eslint-disable-line
+import { withModelValidations } from 'vault/decorators/model-validations';
+import { withExpandedAttributes } from 'vault/decorators/model-expanded-attributes';
+import { supportedSecretBackends } from 'vault/helpers/supported-secret-backends';
+import { isAddonEngine, allEngines, WIF_ENGINES } from 'vault/helpers/mountable-secret-engines';
+import { WHITESPACE_WARNING } from 'vault/utils/model-helpers/validators';
+
+const LINKED_BACKENDS = supportedSecretBackends();
 
 // identity will be managed separately and the inclusion
 // of the system backend is an implementation detail
 const LIST_EXCLUDED_BACKENDS = ['system', 'identity'];
 
-const Validations = buildValidations({
-  path: validator('presence', {
-    presence: true,
-    message: "Path can't be blank.",
-  }),
-  maxVersions: [
-    validator('number', {
-      allowString: true,
-      integer: true,
-      message: 'Maximum versions must be a number.',
-    }),
-    validator('length', {
-      min: 1,
-      max: 16,
-      message: 'You cannot go over 16 characters.',
-    }),
+const validations = {
+  path: [
+    { type: 'presence', message: "Path can't be blank." },
+    {
+      type: 'containsWhiteSpace',
+      message: WHITESPACE_WARNING('path'),
+      level: 'warn',
+    },
   ],
-});
+  maxVersions: [
+    { type: 'number', message: 'Maximum versions must be a number.' },
+    { type: 'length', options: { min: 1, max: 16 }, message: 'You cannot go over 16 characters.' },
+  ],
+};
 
-export default Model.extend(Validations, {
-  path: attr('string'),
-  accessor: attr('string'),
-  name: attr('string'),
-  type: attr('string', {
-    label: 'Secret engine type',
-  }),
-  description: attr('string', {
+@withModelValidations(validations)
+@withExpandedAttributes()
+export default class SecretEngineModel extends Model {
+  @attr('string') path;
+  @attr('string') type;
+  @attr('string', {
     editType: 'textarea',
-  }),
-  config: fragment('mount-config', { defaultValue: {} }),
-  options: fragment('mount-options', { defaultValue: {} }),
-  local: attr('boolean', {
+  })
+  description;
+  @belongsTo('mount-config', { async: false, inverse: null }) config;
+
+  // Enterprise options (still available on OSS)
+  @attr('boolean', {
     helpText:
       'When Replication is enabled, a local mount will not be replicated across clusters. This can only be specified at mount time.',
-  }),
-  sealWrap: attr('boolean', {
+  })
+  local;
+  @attr('boolean', {
     helpText:
-      'When enabled - if a seal supporting seal wrapping is specified in the configuration, all critical security parameters (CSPs) in this backend will be seal wrapped. (For K/V mounts, all values will be seal wrapped.) This can only be specified at mount time.',
-  }),
+      'When enabled - if a seal supporting seal wrapping is specified in the configuration, all critical security parameters (CSPs) in this backend will be seal wrapped. (For KV mounts, all values will be seal wrapped.) This can only be specified at mount time.',
+  })
+  sealWrap;
+  @attr('boolean') externalEntropyAccess;
+
+  // options.version
+  @attr('number', {
+    label: 'Version',
+    helpText:
+      'The KV Secrets Engine can operate in different modes. Version 1 is the original generic Secrets Engine the allows for storing of static key/value pairs. Version 2 added more features including data versioning, TTLs, and check and set.',
+    possibleValues: [2, 1],
+    // This shouldn't be defaultValue because if no version comes back from API we should assume it's v1
+    defaultFormValue: 2, // Set the form to 2 by default
+  })
+  version;
+
+  // AWS specific attributes
+  @attr('string') lease;
+  @attr('string') leaseMax;
+
+  // Returned from API response
+  @attr('string') accessor;
+
   // KV 2 additional config default options
-  maxVersions: attr('number', {
+  @attr('number', {
     defaultValue: 0,
     label: 'Maximum number of versions',
     subText:
       'The number of versions to keep per key. Once the number of keys exceeds the maximum number set here, the oldest version will be permanently deleted. This value applies to all keys, but a key’s metadata settings can overwrite this value. When 0 is used or the value is unset, Vault will keep 10 versions.',
-  }),
-  casRequired: attr('boolean', {
+  })
+  maxVersions;
+  @attr('boolean', {
     defaultValue: false,
     label: 'Require Check and Set',
     subText:
       'If checked, all keys will require the cas parameter to be set on all write requests. A key’s metadata settings can overwrite this value.',
-  }),
-  deleteVersionAfter: attr({
+  })
+  casRequired;
+  @attr({
     defaultValue: 0,
     editType: 'ttl',
     label: 'Automate secret deletion',
     helperTextDisabled: 'A secret’s version must be manually deleted.',
     helperTextEnabled: 'Delete all new versions of this secret after',
-  }),
+  })
+  deleteVersionAfter;
 
-  modelTypeForKV: computed('engineType', 'options.version', function () {
-    let type = this.engineType;
-    let version = this.options?.version;
-    let modelType = 'secret';
-    if ((type === 'kv' || type === 'generic') && version === 2) {
-      modelType = 'secret-v2';
+  /* GETTERS */
+  get isV2KV() {
+    return this.version === 2 && (this.engineType === 'kv' || this.engineType === 'generic');
+  }
+
+  get attrs() {
+    return this.formFields.map((fieldName) => {
+      return this.allByKey[fieldName];
+    });
+  }
+
+  get fieldGroups() {
+    return this._expandGroups(this.formFieldGroups);
+  }
+
+  get icon() {
+    const engineData = allEngines().find((engine) => engine.type === this.engineType);
+
+    return engineData?.glyph || 'lock';
+  }
+
+  get engineType() {
+    return (this.type || '').replace(/^ns_/, '');
+  }
+
+  get shouldIncludeInList() {
+    return !LIST_EXCLUDED_BACKENDS.includes(this.engineType);
+  }
+
+  get isSupportedBackend() {
+    return LINKED_BACKENDS.includes(this.engineType);
+  }
+
+  get backendLink() {
+    if (this.engineType === 'database') {
+      return 'vault.cluster.secrets.backend.overview';
     }
-    return modelType;
-  }),
+    if (isAddonEngine(this.engineType, this.version)) {
+      const { engineRoute } = allEngines().find((engine) => engine.type === this.engineType);
+      return `vault.cluster.secrets.backend.${engineRoute}`;
+    }
+    if (this.isV2KV) {
+      // if it's KV v2 but not registered as an addon, it's type generic
+      return 'vault.cluster.secrets.backend.kv.list';
+    }
+    return `vault.cluster.secrets.backend.list-root`;
+  }
 
-  isV2KV: computed.equal('modelTypeForKV', 'secret-v2'),
+  get backendConfigurationLink() {
+    if (isAddonEngine(this.engineType, this.version)) {
+      return `vault.cluster.secrets.backend.${this.engineType}.configuration`;
+    }
+    return `vault.cluster.secrets.backend.configuration`;
+  }
 
-  formFields: computed('engineType', 'options.version', function () {
-    let type = this.engineType;
-    let version = this.options?.version;
-    let fields = [
-      'type',
-      'path',
-      'description',
-      'accessor',
-      'local',
-      'sealWrap',
-      'config.{defaultLeaseTtl,maxLeaseTtl,auditNonHmacRequestKeys,auditNonHmacResponseKeys,passthroughRequestHeaders}',
-    ];
+  get localDisplay() {
+    return this.local ? 'local' : 'replicated';
+  }
+
+  get formFields() {
+    const type = this.engineType;
+    const fields = ['type', 'path', 'description', 'accessor', 'local', 'sealWrap'];
+    // no ttl options for keymgmt
+    if (type !== 'keymgmt') {
+      fields.push('config.defaultLeaseTtl', 'config.maxLeaseTtl');
+    }
+    fields.push(
+      'config.allowedManagedKeys',
+      'config.auditNonHmacRequestKeys',
+      'config.auditNonHmacResponseKeys',
+      'config.passthroughRequestHeaders',
+      'config.allowedResponseHeaders'
+    );
     if (type === 'kv' || type === 'generic') {
-      fields.push('options.{version}');
+      fields.push('version');
     }
     // version comes in as number not string
-    if (type === 'kv' && version === 2) {
+    if (type === 'kv' && parseInt(this.version, 10) === 2) {
       fields.push('casRequired', 'deleteVersionAfter', 'maxVersions');
     }
+    // For WIF Secret engines, allow users to set the identity token key when mounting the engine.
+    if (WIF_ENGINES.includes(type)) {
+      fields.push('config.identityTokenKey');
+    }
     return fields;
-  }),
+  }
 
-  formFieldGroups: computed('engineType', function () {
-    let type = this.engineType;
-    let defaultGroup;
-    // KV has specific config options it adds on the enable engine. https://www.vaultproject.io/api/secret/kv/kv-v2#configure-the-kv-engine
-    if (type === 'kv') {
-      defaultGroup = { default: ['path', 'maxVersions', 'casRequired', 'deleteVersionAfter'] };
-    } else {
-      defaultGroup = { default: ['path'] };
+  get formFieldGroups() {
+    let defaultFields = ['path'];
+    let optionFields;
+    const CORE_OPTIONS = ['description', 'config.listingVisibility', 'local', 'sealWrap'];
+    const STANDARD_CONFIG = [
+      'config.auditNonHmacRequestKeys',
+      'config.auditNonHmacResponseKeys',
+      'config.passthroughRequestHeaders',
+      'config.allowedResponseHeaders',
+    ];
+
+    switch (this.engineType) {
+      case 'kv':
+        defaultFields = ['path', 'maxVersions', 'casRequired', 'deleteVersionAfter'];
+        optionFields = [
+          'version',
+          ...CORE_OPTIONS,
+          'config.defaultLeaseTtl',
+          'config.maxLeaseTtl',
+          'config.allowedManagedKeys',
+          ...STANDARD_CONFIG,
+        ];
+        break;
+      case 'generic':
+        optionFields = [
+          'version',
+          ...CORE_OPTIONS,
+          'config.defaultLeaseTtl',
+          'config.maxLeaseTtl',
+          'config.allowedManagedKeys',
+          ...STANDARD_CONFIG,
+        ];
+        break;
+      case 'database':
+        // Highlight TTLs in default
+        defaultFields = ['path', 'config.defaultLeaseTtl', 'config.maxLeaseTtl'];
+        optionFields = [...CORE_OPTIONS, 'config.allowedManagedKeys', ...STANDARD_CONFIG];
+        break;
+      case 'pki':
+        defaultFields = ['path', 'config.defaultLeaseTtl', 'config.maxLeaseTtl', 'config.allowedManagedKeys'];
+        optionFields = [...CORE_OPTIONS, ...STANDARD_CONFIG];
+        break;
+      case 'keymgmt':
+        // no ttl options for keymgmt
+        optionFields = [...CORE_OPTIONS, 'config.allowedManagedKeys', ...STANDARD_CONFIG];
+        break;
+      case WIF_ENGINES.find((type) => type === this.engineType):
+        defaultFields = ['path'];
+        optionFields = [
+          ...CORE_OPTIONS,
+          'config.defaultLeaseTtl',
+          'config.maxLeaseTtl',
+          'config.identityTokenKey',
+          'config.allowedManagedKeys',
+          ...STANDARD_CONFIG,
+        ];
+        break;
+      default:
+        defaultFields = ['path'];
+        optionFields = [
+          ...CORE_OPTIONS,
+          'config.defaultLeaseTtl',
+          'config.maxLeaseTtl',
+          'config.allowedManagedKeys',
+          ...STANDARD_CONFIG,
+        ];
+        break;
     }
-    let optionsGroup = {
-      'Method Options': [
-        'description',
-        'config.listingVisibility',
-        'local',
-        'sealWrap',
-        'config.{defaultLeaseTtl,maxLeaseTtl,auditNonHmacRequestKeys,auditNonHmacResponseKeys,passthroughRequestHeaders}',
-      ],
-    };
-    if (type === 'kv' || type === 'generic') {
-      optionsGroup['Method Options'].unshift('options.{version}');
-    }
-    if (type === 'database') {
-      // For the Database Secret Engine we want to highlight the defaultLeaseTtl and maxLeaseTtl, removing them from the options object
-      defaultGroup.default.push('config.{defaultLeaseTtl}', 'config.{maxLeaseTtl}');
-      return [
-        defaultGroup,
-        {
-          'Method Options': [
-            'description',
-            'config.listingVisibility',
-            'local',
-            'sealWrap',
-            'config.{auditNonHmacRequestKeys,auditNonHmacResponseKeys,passthroughRequestHeaders}',
-          ],
-        },
-      ];
-    }
-    return [defaultGroup, optionsGroup];
-  }),
 
-  attrs: computed('formFields', function () {
-    return expandAttributeMeta(this, this.formFields);
-  }),
-
-  fieldGroups: computed('formFieldGroups', function () {
-    return fieldToAttrs(this, this.formFieldGroups);
-  }),
-
-  // namespaces introduced types with a `ns_` prefix for built-in engines
-  // so we need to strip that to normalize the type
-  engineType: computed('type', function () {
-    return (this.type || '').replace(/^ns_/, '');
-  }),
-
-  shouldIncludeInList: computed('engineType', function () {
-    return !LIST_EXCLUDED_BACKENDS.includes(this.engineType);
-  }),
-
-  localDisplay: computed('local', function () {
-    return this.local ? 'local' : 'replicated';
-  }),
-
-  // ssh specific ones
-  privateKey: attr('string'),
-  publicKey: attr('string'),
-  generateSigningKey: attr('boolean', {
-    defaultValue: true,
-  }),
-
-  saveCA(options) {
-    if (this.type !== 'ssh') {
-      return;
-    }
-    if (options.isDelete) {
-      this.setProperties({
-        privateKey: null,
-        publicKey: null,
-        generateSigningKey: false,
-      });
-    }
-    return this.save({
-      adapterOptions: {
-        options: options,
-        apiPath: 'config/ca',
-        attrsToSend: ['privateKey', 'publicKey', 'generateSigningKey'],
+    return [
+      { default: defaultFields },
+      {
+        'Method Options': optionFields,
       },
-    });
-  },
+    ];
+  }
 
+  /* ACTIONS */
   saveZeroAddressConfig() {
     return this.save({
       adapterOptions: {
         adapterMethod: 'saveZeroAddressConfig',
       },
     });
-  },
-
-  // aws backend attrs
-  lease: attr('string'),
-  leaseMax: attr('string'),
-});
+  }
+}

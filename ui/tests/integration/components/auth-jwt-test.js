@@ -1,127 +1,87 @@
-import { run } from '@ember/runloop';
-import EmberObject, { computed } from '@ember/object';
-import Evented from '@ember/object/evented';
-import Service from '@ember/service';
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { _cancelTimers as cancelTimers } from '@ember/runloop';
 import { module, test } from 'qunit';
 import { setupRenderingTest } from 'ember-qunit';
-import { render, settled, waitUntil } from '@ember/test-helpers';
+import { fillIn, render, settled, waitUntil } from '@ember/test-helpers';
 import hbs from 'htmlbars-inline-precompile';
 import sinon from 'sinon';
-import Pretender from 'pretender';
 import { resolve } from 'rsvp';
 import { create } from 'ember-cli-page-object';
 import form from '../../pages/components/auth-jwt';
 import { ERROR_WINDOW_CLOSED, ERROR_MISSING_PARAMS, ERROR_JWT_LOGIN } from 'vault/components/auth-jwt';
+import { fakeWindow, buildMessage } from 'vault/tests/helpers/oidc-window-stub';
+import { setupMirage } from 'ember-cli-mirage/test-support';
+import { overrideResponse } from 'vault/tests/helpers/stubs';
+import { AUTH_FORM } from 'vault/tests/helpers/auth/auth-form-selectors';
 
 const component = create(form);
 const windows = [];
-const buildMessage = (opts) => ({
-  isTrusted: true,
-  origin: 'https://my-vault.com',
-  data: {},
-  ...opts,
-});
-const fakeWindow = EmberObject.extend(Evented, {
-  init() {
-    this._super(...arguments);
-    this.on('close', () => {
-      this.set('closed', true);
-    });
-    windows.push(this);
-  },
-  screen: computed(function () {
-    return {
-      height: 600,
-      width: 500,
-    };
-  }),
-  origin: 'https://my-vault.com',
-  closed: false,
-});
 
 fakeWindow.reopen({
+  init() {
+    this._super(...arguments);
+    windows.push(this);
+  },
   open() {
     return fakeWindow.create();
   },
-
   close() {
     windows.forEach((w) => w.trigger('close'));
   },
 });
 
-const OIDC_AUTH_RESPONSE = {
-  auth: {
-    client_token: 'token',
-  },
-};
-
-const routerStub = Service.extend({
-  urlFor() {
-    return 'http://example.com';
-  },
-});
-
 const renderIt = async (context, path = 'jwt') => {
-  let handler = (data, e) => {
+  const handler = (data, e) => {
     if (e && e.preventDefault) e.preventDefault();
     return resolve();
   };
-  let fake = fakeWindow.create();
+  const fake = fakeWindow.create();
   context.set('window', fake);
   context.set('handler', sinon.spy(handler));
   context.set('roleName', '');
   context.set('selectedAuthPath', path);
   await render(hbs`
     <AuthJwt
-      @window={{window}}
-      @roleName={{roleName}}
-      @selectedAuthPath={{selectedAuthPath}}
-      @onError={{action (mut error)}}
-      @onLoading={{action (mut isLoading)}}
-      @onToken={{action (mut token)}}
-      @onNamespace={{action (mut namespace)}}
-      @onSelectedAuth={{action (mut selectedAuth)}}
-      @onSubmit={{action handler}}
-      @onRoleName={{action (mut roleName)}}
+      @window={{this.window}}
+      @roleName={{this.roleName}}
+      @selectedAuthPath={{this.selectedAuthPath}}
+      @onError={{action (mut this.error)}}
+      @onLoading={{action (mut this.isLoading)}}
+      @onNamespace={{action (mut this.namespace)}}
+      @onSelectedAuth={{action (mut this.selectedAuth)}}
+      @onSubmit={{action this.handler}}
+      @onRoleName={{action (mut this.roleName)}}
     />
     `);
 };
 module('Integration | Component | auth jwt', function (hooks) {
   setupRenderingTest(hooks);
+  setupMirage(hooks);
 
   hooks.beforeEach(function () {
     this.openSpy = sinon.spy(fakeWindow.proto(), 'open');
-    this.owner.register('service:router', routerStub);
-    this.server = new Pretender(function () {
-      this.get('/v1/auth/:path/oidc/callback', function () {
-        return [200, { 'Content-Type': 'application/json' }, JSON.stringify(OIDC_AUTH_RESPONSE)];
-      });
-      this.post('/v1/auth/:path/oidc/auth_url', (request) => {
-        let body = JSON.parse(request.requestBody);
-        if (body.role === 'test') {
-          return [
-            200,
-            { 'Content-Type': 'application/json' },
-            JSON.stringify({
-              data: {
-                auth_url: 'http://example.com',
-              },
-            }),
-          ];
-        }
-        if (body.role === 'okta') {
-          return [
-            200,
-            { 'Content-Type': 'application/json' },
-            JSON.stringify({
-              data: {
-                auth_url: 'http://okta.com',
-              },
-            }),
-          ];
-        }
-        return [400, { 'Content-Type': 'application/json' }, JSON.stringify({ errors: [ERROR_JWT_LOGIN] })];
-      });
+    this.owner.lookup('service:router').reopen({
+      urlFor() {
+        return 'http://example.com';
+      },
+    });
+    this.server.get('/auth/:path/oidc/callback', function () {
+      return { auth: { client_token: 'token' } };
+    });
+    this.server.post('/auth/:path/oidc/auth_url', (_, request) => {
+      const { role } = JSON.parse(request.requestBody);
+      if (['okta', 'test', 'bar'].includes(role)) {
+        const auth_url = role === 'test' ? 'http://example.com' : role === 'okta' ? 'http://okta.com' : '';
+        return {
+          data: { auth_url },
+        };
+      }
+      const errors = role === 'foo' ? ['role "foo" could not be found'] : [ERROR_JWT_LOGIN];
+      return overrideResponse(400, { errors });
     });
   });
 
@@ -131,25 +91,28 @@ module('Integration | Component | auth jwt', function (hooks) {
   });
 
   test('it renders the yield', async function (assert) {
-    await render(hbs`<AuthJwt @onSubmit={{action (mut submit)}}>Hello!</AuthJwt>`);
-    assert.equal(component.yieldContent, 'Hello!', 'yields properly');
+    await render(hbs`<AuthJwt @onSubmit={{action (mut this.submit)}}>Hello!</AuthJwt>`);
+    assert.strictEqual(component.yieldContent, 'Hello!', 'yields properly');
   });
 
   test('jwt: it renders and makes auth_url requests', async function (assert) {
+    let postCount = 0;
+    this.server.post('/auth/:path/oidc/auth_url', (_, request) => {
+      postCount++;
+      const { path } = request.params;
+      const expectedUrl = `/v1/auth/${path}/oidc/auth_url`;
+      assert.strictEqual(request.url, expectedUrl);
+      return overrideResponse(400, { errors: [ERROR_JWT_LOGIN] });
+    });
     await renderIt(this);
     await settled();
+    assert.strictEqual(postCount, 1, 'request to the default path is made');
     assert.ok(component.jwtPresent, 'renders jwt field');
     assert.ok(component.rolePresent, 'renders jwt field');
-    assert.equal(this.server.handledRequests.length, 1, 'request to the default path is made');
-    assert.equal(this.server.handledRequests[0].url, '/v1/auth/jwt/oidc/auth_url');
+
     this.set('selectedAuthPath', 'foo');
     await settled();
-    assert.equal(this.server.handledRequests.length, 2, 'a second request was made');
-    assert.equal(
-      this.server.handledRequests[1].url,
-      '/v1/auth/foo/oidc/auth_url',
-      'requests when path is set'
-    );
+    assert.strictEqual(postCount, 2, 'a second request was made');
   });
 
   test('jwt: it calls passed action on login', async function (assert) {
@@ -159,18 +122,46 @@ module('Integration | Component | auth jwt', function (hooks) {
   });
 
   test('oidc: test role: it renders', async function (assert) {
+    // setting the path also fires off a request to auth_url but this happens inconsistently in tests
+    // setting here so it doesn't affect the postCount because it's not relevant to what's being tested
+    this.set('selectedAuthPath', 'foo');
+    let postCount = 0;
+    this.server.post('/auth/:path/oidc/auth_url', (_, request) => {
+      postCount++;
+      const { role } = JSON.parse(request.requestBody);
+      const auth_url = role === 'test' ? 'http://example.com' : role === 'okta' ? 'http://okta.com' : '';
+      return {
+        data: { auth_url },
+      };
+    });
     await renderIt(this);
     await settled();
-    this.set('selectedAuthPath', 'foo');
-    await component.role('test');
-    await settled();
-    assert.notOk(component.jwtPresent, 'does not show jwt input for OIDC type login');
-    assert.equal(component.loginButtonText, 'Sign in with OIDC Provider');
-
-    await component.role('okta');
+    await fillIn(AUTH_FORM.roleInput, 'test');
+    assert
+      .dom(AUTH_FORM.input('jwt'))
+      .doesNotExist('does not show jwt token input if role matches OIDC login url');
+    assert.dom(AUTH_FORM.login).hasText('Sign in with OIDC Provider');
+    await fillIn(AUTH_FORM.roleInput, 'okta');
     // 1 for initial render, 1 for each time role changed = 3
-    assert.equal(this.server.handledRequests.length, 4, 'fetches the auth_url when the path changes');
-    assert.equal(component.loginButtonText, 'Sign in with Okta', 'recognizes auth methods with certain urls');
+    assert.strictEqual(postCount, 3, 'fetches the auth_url when the role changes');
+    assert.dom(AUTH_FORM.login).hasText('Sign in with Okta', 'recognizes auth methods with certain urls');
+  });
+
+  test('oidc: it fetches auth_url when path changes', async function (assert) {
+    assert.expect(2);
+    this.set('selectedAuthPath', 'foo');
+    await renderIt(this);
+    // auth_url is requested on initial render so stubbing after rendering the component
+    // to test auth_url is called when the :path changes
+    this.server.post('/auth/:path/oidc/auth_url', (_, request) => {
+      assert.true(true, 'request is made to auth_url');
+      assert.strictEqual(request?.params?.path, 'foo', 'request params are { path: foo }');
+      return {
+        data: { auth_url: '' },
+      };
+    });
+    this.set('selectedAuthPath', 'foo');
+    await settled();
   });
 
   test('oidc: it calls window.open popup window on login', async function (assert) {
@@ -181,8 +172,11 @@ module('Integration | Component | auth jwt', function (hooks) {
     await waitUntil(() => {
       return this.openSpy.calledOnce;
     });
-    run.cancelTimers();
-    let call = this.openSpy.getCall(0);
+
+    cancelTimers();
+    await settled();
+
+    const call = this.openSpy.getCall(0);
     assert.deepEqual(
       call.args,
       ['http://example.com', 'vaultOIDCWindow', 'width=500,height=600,resizable,scrollbars=yes,top=0,left=0'],
@@ -200,7 +194,7 @@ module('Integration | Component | auth jwt', function (hooks) {
     });
     this.window.close();
     await settled();
-    assert.equal(this.error, ERROR_WINDOW_CLOSED, 'calls onError with error string');
+    assert.strictEqual(this.error, ERROR_WINDOW_CLOSED, 'calls onError with error string');
   });
 
   test('oidc: shows error when message posted with state key, wrong params', async function (assert) {
@@ -215,8 +209,10 @@ module('Integration | Component | auth jwt', function (hooks) {
       'message',
       buildMessage({ data: { source: 'oidc-callback', state: 'state', foo: 'bar' } })
     );
-    run.cancelTimers();
-    assert.equal(this.error, ERROR_MISSING_PARAMS, 'calls onError with params missing error');
+    cancelTimers();
+    await settled();
+
+    assert.strictEqual(this.error, ERROR_MISSING_PARAMS, 'calls onError with params missing error');
   });
 
   test('oidc: storage event fires with state key, correct params', async function (assert) {
@@ -227,21 +223,15 @@ module('Integration | Component | auth jwt', function (hooks) {
     await waitUntil(() => {
       return this.openSpy.calledOnce;
     });
-    this.window.trigger(
-      'message',
-      buildMessage({
-        data: {
-          source: 'oidc-callback',
-          path: 'foo',
-          state: 'state',
-          code: 'code',
-        },
-      })
-    );
+    this.window.trigger('message', buildMessage());
     await settled();
-    assert.equal(this.selectedAuth, 'token', 'calls onSelectedAuth with token');
-    assert.equal(this.token, 'token', 'calls onToken with token');
-    assert.ok(this.handler.calledOnce, 'calls the onSubmit handler');
+    const [callbackData, , token] = this.handler.lastCall.args;
+    assert.propEqual(
+      callbackData,
+      { mfa_requirement: undefined },
+      'mfa_requirement is undefined if not returned by response'
+    );
+    assert.strictEqual(token, 'token', 'calls the onSubmit handler with token');
   });
 
   test('oidc: fails silently when event origin does not match window origin', async function (assert) {
@@ -252,21 +242,12 @@ module('Integration | Component | auth jwt', function (hooks) {
     await waitUntil(() => {
       return this.openSpy.calledOnce;
     });
-    this.window.trigger(
-      'message',
-      buildMessage({
-        origin: 'http://hackerz.com',
-        data: {
-          source: 'oidc-callback',
-          path: 'foo',
-          state: 'state',
-          code: 'code',
-        },
-      })
-    );
-    run.cancelTimers();
+    this.window.trigger('message', buildMessage({ origin: 'http://hackerz.com' }));
+
+    cancelTimers();
     await settled();
-    assert.notOk(this.handler.called, 'should not call the submit handler');
+
+    assert.false(this.handler.called, 'should not call the submit handler');
   });
 
   test('oidc: fails silently when event is not trusted', async function (assert) {
@@ -277,20 +258,32 @@ module('Integration | Component | auth jwt', function (hooks) {
     await waitUntil(() => {
       return this.openSpy.calledOnce;
     });
-    this.window.trigger(
-      'message',
-      buildMessage({
-        isTrusted: false,
-        data: {
-          source: 'oidc-callback',
-          path: 'foo',
-          state: 'state',
-          code: 'code',
-        },
-      })
-    );
-    run.cancelTimers();
+    this.window.trigger('message', buildMessage({ isTrusted: false }));
+    cancelTimers();
     await settled();
-    assert.notOk(this.handler.called, 'should not call the submit handler');
+
+    assert.false(this.handler.called, 'should not call the submit handler');
+  });
+
+  test('oidc: it should trigger error callback when role is not found', async function (assert) {
+    await renderIt(this, 'oidc');
+    await component.role('foo');
+    await component.login();
+    assert.strictEqual(
+      this.error,
+      'Invalid role. Please try again.',
+      'Error message is returned when role is not found'
+    );
+  });
+
+  test('oidc: it should trigger error callback when role is returned without auth_url', async function (assert) {
+    await renderIt(this, 'oidc');
+    await component.role('bar');
+    await component.login();
+    assert.strictEqual(
+      this.error,
+      'Missing auth_url. Please check that allowed_redirect_uris for the role include this mount path.',
+      'Error message is returned when role is returned without auth_url'
+    );
   });
 });

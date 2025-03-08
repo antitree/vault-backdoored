@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package command
 
 import (
@@ -6,7 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mitchellh/cli"
+	"github.com/hashicorp/cli"
+	"github.com/hashicorp/vault/api"
 	"github.com/posener/complete"
 )
 
@@ -14,6 +18,13 @@ var (
 	_ cli.Command             = (*WriteCommand)(nil)
 	_ cli.CommandAutocomplete = (*WriteCommand)(nil)
 )
+
+// MFAMethodInfo contains the information about an MFA method
+type MFAMethodInfo struct {
+	methodID    string
+	methodType  string
+	usePasscode bool
+}
 
 // WriteCommand is a Command that puts data into the Vault.
 type WriteCommand struct {
@@ -40,13 +51,15 @@ Usage: vault write [options] PATH [DATA K=V...]
   it is loaded from a file. If the value is "-", Vault will read the value from
   stdin.
 
-  Persist data in the generic secrets engine:
+  Store an arbitrary secret in the token's cubbyhole.
 
-      $ vault write secret/my-secret foo=bar
+      $ vault write cubbyhole/git-credentials username="student01" password="p@$$w0rd"
 
   Create a new encryption key in the transit secrets engine:
 
-      $ vault write -f transit/keys/my-key
+      $ vault write -force transit/keys/my-key
+
+  The -force / -f flag allows a write operation without any input data.
 
   Upload an AWS IAM policy from a file on disk:
 
@@ -55,6 +68,10 @@ Usage: vault write [options] PATH [DATA K=V...]
   Configure access to Consul by providing an access token:
 
       $ echo $MY_TOKEN | vault write consul/config/access token=-
+
+  Create a token
+
+      $ vault write auth/token/create policies="admin" policies="secops" ttl=8h num_uses=3
 
   For a full list of examples and paths, please see the documentation that
   corresponds to the secret engines in use.
@@ -131,6 +148,10 @@ func (c *WriteCommand) Run(args []string) int {
 	}
 
 	secret, err := client.Logical().Write(path, data)
+	return handleWriteSecretOutput(c.BaseCommand, path, secret, err)
+}
+
+func handleWriteSecretOutput(c *BaseCommand, path string, secret *api.Secret, err error) int {
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error writing data to %s: %s", path, err))
 		if secret != nil {
@@ -140,10 +161,26 @@ func (c *WriteCommand) Run(args []string) int {
 	}
 	if secret == nil {
 		// Don't output anything unless using the "table" format
-		if Format(c.UI) == "table" {
+		// and even then, don't output anything if a specific field was requested
+		if c.flagField == "" && Format(c.UI) == "table" {
 			c.UI.Info(fmt.Sprintf("Success! Data written to: %s", path))
 		}
 		return 0
+	}
+
+	// Currently, if there is only one MFA method configured, the login
+	// request is validated interactively
+	methodInfo := c.getInteractiveMFAMethodInfo(secret)
+	if methodInfo != nil {
+		secret, err = c.validateMFA(secret.Auth.MFARequirement.MFARequestID, *methodInfo)
+		if err != nil {
+			c.UI.Error(err.Error())
+			return 2
+		}
+	} else if c.getMFAValidationRequired(secret) {
+		c.UI.Warn(wrapAtLength("A login request was issued that is subject to "+
+			"MFA validation. Please make sure to validate the login by sending another "+
+			"request to sys/mfa/validate endpoint.") + "\n")
 	}
 
 	// Handle single field output

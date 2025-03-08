@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package vault
 
 import (
@@ -6,22 +9,31 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-uuid"
+	snapshot "github.com/hashicorp/raft-snapshot"
+	"github.com/hashicorp/vault/helper/constants"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/physical/raft"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
-
-	proto "github.com/golang/protobuf/proto"
-	wrapping "github.com/hashicorp/go-kms-wrapping"
-	uuid "github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/vault/helper/namespace"
-	"github.com/hashicorp/vault/physical/raft"
+	"github.com/hashicorp/vault/vault/seal"
+	"github.com/mitchellh/mapstructure"
 )
 
 // raftStoragePaths returns paths for use when raft is the storage mechanism.
 func (b *SystemBackend) raftStoragePaths() []*framework.Path {
+	makeSealer := func(logger hclog.Logger, use string) func() snapshot.Sealer {
+		return func() snapshot.Sealer {
+			return NewSealAccessSealer(b.Core.seal.GetAccess(), logger, use)
+		}
+	}
+
 	return []*framework.Path{
 		{
 			Pattern: "storage/raft/bootstrap/answer",
@@ -38,6 +50,12 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 				},
 				"non_voter": {
 					Type: framework.TypeBool,
+				},
+				"upgrade_version": {
+					Type: framework.TypeString,
+				},
+				"sdk_version": {
+					Type: framework.TypeString,
 				},
 			},
 
@@ -62,7 +80,7 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.UpdateOperation: &framework.PathOperation{
-					Callback: b.handleRaftBootstrapChallengeWrite(),
+					Callback: b.handleRaftBootstrapChallengeWrite(makeSealer(nil, "bootstrap_challenge_write")),
 					Summary:  "Creates a challenge for the new peer to be joined to the raft cluster.",
 				},
 			},
@@ -124,11 +142,11 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 			Pattern: "storage/raft/snapshot",
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
-					Callback: b.handleStorageRaftSnapshotRead(),
+					Callback: b.handleStorageRaftSnapshotRead(makeSealer(nil, "snapshot_read")),
 					Summary:  "Returns a snapshot of the current state of vault.",
 				},
 				logical.UpdateOperation: &framework.PathOperation{
-					Callback: b.handleStorageRaftSnapshotWrite(false),
+					Callback: b.handleStorageRaftSnapshotWrite(false, makeSealer(b.logger, "snapshot_write")),
 					Summary:  "Installs the provided snapshot, returning the cluster to the state defined in it.",
 				},
 			},
@@ -140,7 +158,7 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 			Pattern: "storage/raft/snapshot-force",
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.UpdateOperation: &framework.PathOperation{
-					Callback: b.handleStorageRaftSnapshotWrite(true),
+					Callback: b.handleStorageRaftSnapshotWrite(true, makeSealer(b.logger, "snapshot_write")),
 					Summary:  "Installs the provided snapshot, returning the cluster to the state defined in it. This bypasses checks ensuring the current Autounseal or Shamir keys are consistent with the snapshot data.",
 				},
 			},
@@ -152,8 +170,9 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 			Pattern: "storage/raft/autopilot/state",
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
-					Callback: b.verifyDROperationTokenOnSecondary(b.handleStorageRaftAutopilotState(), false),
-					Summary:  "Returns the state of the raft cluster under integrated storage as seen by autopilot.",
+					Callback:                  b.verifyDROperationTokenOnSecondary(b.handleStorageRaftAutopilotState(), false),
+					Summary:                   "Returns the state of the raft cluster under integrated storage as seen by autopilot.",
+					ForwardPerformanceStandby: true,
 				},
 			},
 
@@ -186,6 +205,14 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 				"server_stabilization_time": {
 					Type:        framework.TypeDurationSecond,
 					Description: "Minimum amount of time a server must be in a stable, healthy state before it can be added to the cluster.",
+				},
+				"disable_upgrade_migration": {
+					Type:        framework.TypeBool,
+					Description: "Whether or not to perform automated version upgrades.",
+				},
+				"dr_operation_token": {
+					Type:        framework.TypeString,
+					Description: "DR operation token used to authorize this request (if a DR secondary node).",
 				},
 			},
 
@@ -239,15 +266,25 @@ func (b *SystemBackend) handleRaftRemovePeerUpdate() framework.OperationFunc {
 		if err := raftBackend.RemovePeer(ctx, serverID); err != nil {
 			return nil, err
 		}
-		if b.Core.raftFollowerStates != nil {
-			b.Core.raftFollowerStates.Delete(serverID)
+
+		b.Core.raftFollowerStates.Delete(serverID)
+		_, err := raftBackend.RemovedServerCleanup(ctx, serverID)
+		if err != nil {
+			// log the error but don't return it - we might get an error if we can't find the node in the cache, which
+			// is not an error condition in this instance.
+			b.logger.Info("attempted to remove node from perf standby cache but it failed, which might be fine", "server ID", serverID, "error", err)
+			return nil, nil
 		}
 
 		return nil, nil
 	}
 }
 
-func (b *SystemBackend) handleRaftBootstrapChallengeWrite() framework.OperationFunc {
+const answerSize = 16
+
+var answerMaxEncodedSize = base64.StdEncoding.EncodedLen(answerSize)
+
+func (b *SystemBackend) handleRaftBootstrapChallengeWrite(makeSealer func() snapshot.Sealer) framework.OperationFunc {
 	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 		serverID := d.Get("server_id").(string)
 		if len(serverID) == 0 {
@@ -255,27 +292,42 @@ func (b *SystemBackend) handleRaftBootstrapChallengeWrite() framework.OperationF
 		}
 
 		var answer []byte
-		answerRaw, ok := b.Core.pendingRaftPeers.Load(serverID)
+		b.Core.pendingRaftPeersLock.RLock()
+		challenge, ok := b.Core.pendingRaftPeers.Get(serverID)
+		b.Core.pendingRaftPeersLock.RUnlock()
 		if !ok {
-			var err error
-			answer, err = uuid.GenerateRandomBytes(16)
-			if err != nil {
-				return nil, err
+			if !b.raftChallengeLimiter.Allow() {
+				return logical.RespondWithStatusCode(logical.ErrorResponse("too many raft challenges in flight"), req, http.StatusTooManyRequests)
 			}
-			b.Core.pendingRaftPeers.Store(serverID, answer)
-		} else {
-			answer = answerRaw.([]byte)
-		}
 
-		sealAccess := b.Core.seal.GetAccess()
+			b.Core.pendingRaftPeersLock.Lock()
+			defer b.Core.pendingRaftPeersLock.Unlock()
 
-		eBlob, err := sealAccess.Encrypt(ctx, answer, nil)
-		if err != nil {
-			return nil, err
-		}
-		protoBlob, err := proto.Marshal(eBlob)
-		if err != nil {
-			return nil, err
+			challenge, ok = b.Core.pendingRaftPeers.Get(serverID)
+			if !ok {
+
+				var err error
+				answer, err = uuid.GenerateRandomBytes(answerSize)
+				if err != nil {
+					return nil, err
+				}
+
+				sealer := makeSealer()
+				if sealer == nil {
+					return nil, errors.New("core has no seal access to write raft bootstrap challenge")
+				}
+				protoBlob, err := sealer.Seal(ctx, answer)
+				if err != nil {
+					return nil, err
+				}
+
+				challenge = &raftBootstrapChallenge{
+					serverID:  serverID,
+					answer:    answer,
+					challenge: protoBlob,
+				}
+				b.Core.pendingRaftPeers.Add(serverID, challenge)
+			}
 		}
 
 		sealConfig, err := b.Core.seal.BarrierConfig(ctx)
@@ -285,7 +337,7 @@ func (b *SystemBackend) handleRaftBootstrapChallengeWrite() framework.OperationF
 
 		return &logical.Response{
 			Data: map[string]interface{}{
-				"challenge":   base64.StdEncoding.EncodeToString(protoBlob),
+				"challenge":   base64.StdEncoding.EncodeToString(challenge.challenge),
 				"seal_config": sealConfig,
 			},
 		}, nil
@@ -307,6 +359,9 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 		if len(answerRaw) == 0 {
 			return logical.ErrorResponse("no answer provided"), logical.ErrInvalidRequest
 		}
+		if len(answerRaw) > answerMaxEncodedSize {
+			return logical.ErrorResponse("answer is too long"), logical.ErrInvalidRequest
+		}
 		clusterAddr := d.Get("cluster_addr").(string)
 		if len(clusterAddr) == 0 {
 			return logical.ErrorResponse("no cluster_addr provided"), logical.ErrInvalidRequest
@@ -319,14 +374,17 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 			return logical.ErrorResponse("could not base64 decode answer"), logical.ErrInvalidRequest
 		}
 
-		expectedAnswerRaw, ok := b.Core.pendingRaftPeers.Load(serverID)
+		b.Core.pendingRaftPeersLock.Lock()
+		expectedChallenge, ok := b.Core.pendingRaftPeers.Get(serverID)
 		if !ok {
+			b.Core.pendingRaftPeersLock.Unlock()
 			return logical.ErrorResponse("no expected answer for the server id provided"), logical.ErrInvalidRequest
 		}
 
-		b.Core.pendingRaftPeers.Delete(serverID)
+		b.Core.pendingRaftPeers.Remove(serverID)
+		b.Core.pendingRaftPeersLock.Unlock()
 
-		if subtle.ConstantTimeCompare(answer, expectedAnswerRaw.([]byte)) == 0 {
+		if subtle.ConstantTimeCompare(answer, expectedChallenge.answer) == 0 {
 			return logical.ErrorResponse("invalid answer given"), logical.ErrInvalidRequest
 		}
 
@@ -342,6 +400,21 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 			return nil, errors.New("could not decode raft TLS configuration")
 		}
 
+		var desiredSuffrage string
+		switch nonVoter {
+		case true:
+			desiredSuffrage = "non-voter"
+		default:
+			desiredSuffrage = "voter"
+		}
+
+		added := b.Core.raftFollowerStates.Update(&raft.EchoRequestUpdate{
+			NodeID:          serverID,
+			DesiredSuffrage: desiredSuffrage,
+			SDKVersion:      d.Get("sdk_version").(string),
+			UpgradeVersion:  d.Get("upgrade_version").(string),
+		})
+
 		switch nonVoter {
 		case true:
 			err = raftBackend.AddNonVotingPeer(ctx, serverID, clusterAddr)
@@ -349,19 +422,10 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 			err = raftBackend.AddPeer(ctx, serverID, clusterAddr)
 		}
 		if err != nil {
+			if added {
+				b.Core.raftFollowerStates.Delete(serverID)
+			}
 			return nil, err
-		}
-
-		var desiredSuffrage string
-		switch nonVoter {
-		case true:
-			desiredSuffrage = "voter"
-		default:
-			desiredSuffrage = "non-voter"
-		}
-
-		if b.Core.raftFollowerStates != nil {
-			b.Core.raftFollowerStates.Update(serverID, 0, 0, desiredSuffrage)
 		}
 
 		peers, err := raftBackend.Peers(ctx)
@@ -375,13 +439,13 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 			Data: map[string]interface{}{
 				"peers":              peers,
 				"tls_keyring":        &keyring,
-				"autoloaded_license": LicenseAutoloaded(b.Core),
+				"autoloaded_license": b.Core.entIsLicenseAutoloaded(),
 			},
 		}, nil
 	}
 }
 
-func (b *SystemBackend) handleStorageRaftSnapshotRead() framework.OperationFunc {
+func (b *SystemBackend) handleStorageRaftSnapshotRead(makeSealer func() snapshot.Sealer) framework.OperationFunc {
 	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 		raftStorage, ok := b.Core.underlyingPhysical.(*raft.RaftBackend)
 		if !ok {
@@ -391,7 +455,7 @@ func (b *SystemBackend) handleStorageRaftSnapshotRead() framework.OperationFunc 
 			return nil, errors.New("no writer for request")
 		}
 
-		err := raftStorage.SnapshotHTTP(req.ResponseWriter, b.Core.seal.GetAccess())
+		err := raftStorage.SnapshotHTTP(req.ResponseWriter, makeSealer())
 		if err != nil {
 			return nil, err
 		}
@@ -416,15 +480,14 @@ func (b *SystemBackend) handleStorageRaftAutopilotState() framework.OperationFun
 			return nil, nil
 		}
 
+		data := make(map[string]interface{})
+		err = mapstructure.Decode(state, &data)
+		if err != nil {
+			return nil, err
+		}
+
 		return &logical.Response{
-			Data: map[string]interface{}{
-				"healthy":           state.Healthy,
-				"failure_tolerance": state.FailureTolerance,
-				"servers":           state.Servers,
-				"leader":            state.Leader,
-				"voters":            state.Voters,
-				"non_voters":        state.NonVoters,
-			},
+			Data: data,
 		}, nil
 	}
 }
@@ -449,6 +512,7 @@ func (b *SystemBackend) handleStorageRaftAutopilotConfigRead() framework.Operati
 				"max_trailing_logs":                  config.MaxTrailingLogs,
 				"min_quorum":                         config.MinQuorum,
 				"server_stabilization_time":          config.ServerStabilizationTime.String(),
+				"disable_upgrade_migration":          config.DisableUpgradeMigration,
 			},
 		}, nil
 	}
@@ -505,12 +569,24 @@ func (b *SystemBackend) handleStorageRaftAutopilotConfigUpdate() framework.Opera
 			config.ServerStabilizationTime = time.Duration(serverStabilizationTime.(int)) * time.Second
 			persist = true
 		}
+		disableUpgradeMigration, ok := d.GetOk("disable_upgrade_migration")
+		if ok {
+			if !constants.IsEnterprise {
+				return logical.ErrorResponse("disable_upgrade_migration is only available in Vault Enterprise"), logical.ErrInvalidRequest
+			}
+			config.DisableUpgradeMigration = disableUpgradeMigration.(bool)
+			persist = true
+		}
 
 		effectiveConf := raftBackend.AutopilotConfig()
 		effectiveConf.Merge(config)
 
 		if effectiveConf.CleanupDeadServers && effectiveConf.MinQuorum < 3 {
 			return logical.ErrorResponse(fmt.Sprintf("min_quorum must be set when cleanup_dead_servers is set and it should at least be 3; cleanup_dead_servers: %#v, min_quorum: %#v", effectiveConf.CleanupDeadServers, effectiveConf.MinQuorum)), logical.ErrInvalidRequest
+		}
+
+		if effectiveConf.CleanupDeadServers && effectiveConf.DeadServerLastContactThreshold.Seconds() < 60 {
+			return logical.ErrorResponse(fmt.Sprintf("dead_server_last_contact_threshold should not be set to less than 1m; received: %v", deadServerLastContactThreshold)), logical.ErrInvalidRequest
 		}
 
 		// Persist only the user supplied fields
@@ -531,31 +607,32 @@ func (b *SystemBackend) handleStorageRaftAutopilotConfigUpdate() framework.Opera
 	}
 }
 
-func (b *SystemBackend) handleStorageRaftSnapshotWrite(force bool) framework.OperationFunc {
+func (b *SystemBackend) handleStorageRaftSnapshotWrite(force bool, makeSealer func() snapshot.Sealer) framework.OperationFunc {
 	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 		raftStorage, ok := b.Core.underlyingPhysical.(*raft.RaftBackend)
 		if !ok {
 			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
 		}
-		if req.HTTPRequest == nil || req.HTTPRequest.Body == nil {
+		body, ok := logical.ContextOriginalBodyValue(ctx)
+		if !ok {
 			return nil, errors.New("no reader for request")
 		}
 
-		access := b.Core.seal.GetAccess()
-		if force {
-			access = nil
+		var sealer snapshot.Sealer
+		if !force {
+			sealer = makeSealer()
 		}
 
 		// We want to buffer the http request reader into a temp file here so we
 		// don't have to hold the full snapshot in memory. We also want to do
 		// the restore in two parts so we can restore the snapshot while the
 		// stateLock is write locked.
-		snapFile, cleanup, metadata, err := raftStorage.WriteSnapshotToTemp(req.HTTPRequest.Body, access)
+		snapFile, cleanup, metadata, err := raftStorage.WriteSnapshotToTemp(body, sealer)
 		switch {
 		case err == nil:
 		case strings.Contains(err.Error(), "failed to open the sealed hashes"):
-			switch b.Core.seal.BarrierType() {
-			case wrapping.Shamir:
+			switch b.Core.seal.BarrierSealConfigType() {
+			case SealConfigTypeShamir:
 				return logical.ErrorResponse("could not verify hash file, possibly the snapshot is using a different set of unseal keys; use the snapshot-force API to bypass this check"), logical.ErrInvalidRequest
 			default:
 				return logical.ErrorResponse("could not verify hash file, possibly the snapshot is using a different autoseal key; use the snapshot-force API to bypass this check"), logical.ErrInvalidRequest
@@ -572,7 +649,9 @@ func (b *SystemBackend) handleStorageRaftSnapshotWrite(force bool) framework.Ope
 			defer cleanup()
 
 			// Grab statelock
-			if stopped := grabLockOrStop(b.Core.stateLock.Lock, b.Core.stateLock.Unlock, b.Core.standbyStopCh.Load().(chan struct{})); stopped {
+			l := newLockGrabber(b.Core.stateLock.Lock, b.Core.stateLock.Unlock, b.Core.standbyStopCh.Load().(chan struct{}))
+			go l.grab()
+			if stopped := l.lockOrStop(); stopped {
 				b.Core.logger.Error("not applying snapshot; shutting down")
 				return
 			}
@@ -678,4 +757,53 @@ var sysRaftHelp = map[string][2]string{
 		"Returns autopilot configuration.",
 		"",
 	},
+}
+
+func NewSealAccessSealer(access seal.Access, logger hclog.Logger, use string) snapshot.Sealer {
+	// If we have access to the seal create a sealer object
+	var s snapshot.Sealer
+	if access != nil {
+		s = &sealer{
+			access: access,
+			logger: logger,
+			use:    use,
+		}
+	}
+	return s
+}
+
+// sealer implements the snapshot.Sealer interface and is used in the snapshot
+// process for encrypting/decrypting the SHASUM file in snapshot archives.
+type sealer struct {
+	access seal.Access
+	logger hclog.Logger
+	use    string
+}
+
+var _ snapshot.Sealer = (*sealer)(nil)
+
+// Seal encrypts the data with using the seal access object.
+func (s *sealer) Seal(ctx context.Context, pt []byte) ([]byte, error) {
+	wrappedValue, err := SealWrapValue(ctx, s.access, true, pt, func(_ context.Context, errs map[string]error) error {
+		if s.logger != nil {
+			s.logger.Warn("sealed value not wrapped with all seals", "use", s.use)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return MarshalSealWrappedValue(wrappedValue)
+}
+
+// Open decrypts the data using the seal access object.
+func (s *sealer) Open(ctx context.Context, ct []byte) ([]byte, error) {
+	wrappedEntryValue, err := UnmarshalSealWrappedValue(ct)
+	if err != nil {
+		return nil, err
+	}
+
+	pt, _, err := UnsealWrapValue(ctx, s.access, "", wrappedEntryValue)
+	return pt, err
 }

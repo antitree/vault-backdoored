@@ -1,11 +1,17 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package logical
 
 import (
 	"context"
 	"crypto"
 	"io"
+
+	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 )
 
+//go:generate enumer -type=KeyUsage -trimprefix=KeyUsage -transform=snake
 type KeyUsage int
 
 const (
@@ -15,6 +21,7 @@ const (
 	KeyUsageVerify
 	KeyUsageWrap
 	KeyUsageUnwrap
+	KeyUsageGenerateRandom
 )
 
 type ManagedKey interface {
@@ -27,15 +34,45 @@ type ManagedKey interface {
 	// Present returns true if the key is established in the KMS.  This may return false if for example
 	// an HSM library is not configured on all cluster nodes.
 	Present(ctx context.Context) (bool, error)
-	Finalize(context.Context) error
 
 	// AllowsAll returns true if all the requested usages are supported by the managed key.
 	AllowsAll(usages []KeyUsage) bool
 }
 
+type (
+	ManagedKeyConsumer             func(context.Context, ManagedKey) error
+	ManagedSigningKeyConsumer      func(context.Context, ManagedSigningKey) error
+	ManagedEncryptingKeyConsumer   func(context.Context, ManagedEncryptingKey) error
+	ManagedMACKeyConsumer          func(context.Context, ManagedMACKey) error
+	ManagedKeyRandomSourceConsumer func(context.Context, ManagedKeyRandomSource) error
+)
+
 type ManagedKeySystemView interface {
-	GetManagedKeyByName(ctx context.Context, keyName, mountPoint string) (ManagedKey, error)
-	GetManagedKeyByUUID(ctx context.Context, keyUuid, mountPoint string) (ManagedKey, error)
+	// WithManagedKeyByName retrieves an instantiated managed key for consumption by the given function.  The
+	// provided key can only be used within the scope of that function call
+	WithManagedKeyByName(ctx context.Context, keyName, backendUUID string, f ManagedKeyConsumer) error
+	// WithManagedKeyByUUID retrieves an instantiated managed key for consumption by the given function.  The
+	// provided key can only be used within the scope of that function call
+	WithManagedKeyByUUID(ctx context.Context, keyUuid, backendUUID string, f ManagedKeyConsumer) error
+
+	// WithManagedSigningKeyByName retrieves an instantiated managed signing key for consumption by the given function,
+	// with the same semantics as WithManagedKeyByName
+	WithManagedSigningKeyByName(ctx context.Context, keyName, backendUUID string, f ManagedSigningKeyConsumer) error
+	// WithManagedSigningKeyByUUID retrieves an instantiated managed signing key for consumption by the given function,
+	// with the same semantics as WithManagedKeyByUUID
+	WithManagedSigningKeyByUUID(ctx context.Context, keyUuid, backendUUID string, f ManagedSigningKeyConsumer) error
+	// WithManagedSigningKeyByName retrieves an instantiated managed signing key for consumption by the given function,
+	// with the same semantics as WithManagedKeyByName
+	WithManagedEncryptingKeyByName(ctx context.Context, keyName, backendUUID string, f ManagedEncryptingKeyConsumer) error
+	// WithManagedSigningKeyByUUID retrieves an instantiated managed signing key for consumption by the given function,
+	// with the same semantics as WithManagedKeyByUUID
+	WithManagedEncryptingKeyByUUID(ctx context.Context, keyUuid, backendUUID string, f ManagedEncryptingKeyConsumer) error
+	// WithManagedMACKeyByName retrieves an instantiated managed MAC key by name for consumption by the given function,
+	// with the same semantics as WithManagedKeyByName.
+	WithManagedMACKeyByName(ctx context.Context, keyName, backendUUID string, f ManagedMACKeyConsumer) error
+	// WithManagedMACKeyByUUID retrieves an instantiated managed MAC key by UUID for consumption by the given function,
+	// with the same semantics as WithManagedKeyByUUID.
+	WithManagedMACKeyByUUID(ctx context.Context, keyUUID, backendUUID string, f ManagedMACKeyConsumer) error
 }
 
 type ManagedAsymmetricKey interface {
@@ -66,4 +103,24 @@ type ManagedSigningKey interface {
 	// GetSigner returns an implementation of crypto.Signer backed by the managed key.  This should be called
 	// as needed so as to use per request contexts.
 	GetSigner(context.Context) (crypto.Signer, error)
+}
+
+type ManagedEncryptingKey interface {
+	ManagedKey
+	Encrypt(ctx context.Context, plaintext []byte, options ...wrapping.Option) ([]byte, error)
+	Decrypt(ctx context.Context, ciphertext []byte, options ...wrapping.Option) ([]byte, error)
+}
+
+type ManagedMACKey interface {
+	ManagedKey
+
+	// MAC generates a MAC tag using the provided algorithm for the provided value.
+	MAC(ctx context.Context, algorithm string, data []byte) ([]byte, error)
+}
+
+type ManagedKeyRandomSource interface {
+	ManagedKey
+
+	// GetRandomBytes returns a number (specified by the count parameter) of random bytes sourced from the target managed key.
+	GetRandomBytes(count int) ([]byte, error)
 }

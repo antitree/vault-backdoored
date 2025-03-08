@@ -1,46 +1,72 @@
+/**
+ * Copyright (c) HashiCorp, Inc.
+ * SPDX-License-Identifier: BUSL-1.1
+ */
 import Component from '@glimmer/component';
-import { inject as service } from '@ember/service';
+import { service } from '@ember/service';
 import { action } from '@ember/object';
 import { tracked } from '@glimmer/tracking';
+import { waitFor } from '@ember/test-waiters';
+import { task } from 'ember-concurrency';
+import errorMessage from 'vault/utils/error-message';
 
+/**
+ * @module DatabaseRoleEdit component is used to configure a database role.
+ * See secret-edit-layout which uses options for backend to determine which component to render.
+ * @example
+ * <DatabaseRoleEdit
+    @model={{this.model.database.role}}
+    @tab="edit"
+    @model="edit"
+    @initialKey=this.initialKey
+    />
+ *
+ * @param {object} model - The database role model.
+ * @param {string} tab - The tab to render.
+ * @param {string} mode - The mode to render. Either 'create' or 'edit'.
+ * @param {string} [initialKey] - The initial key to set for the database role.
+ */
 const LIST_ROOT_ROUTE = 'vault.cluster.secrets.backend.list-root';
 const SHOW_ROUTE = 'vault.cluster.secrets.backend.show';
-
 export default class DatabaseRoleEdit extends Component {
   @service router;
   @service flashMessages;
-  @service wizard;
   @service store;
+  @tracked modelValidations;
+  @tracked invalidFormAlert;
+  @tracked errorMessage = '';
 
   constructor() {
     super(...arguments);
-    if (
-      this.wizard.featureState === 'displayConnection' ||
-      this.wizard.featureState === 'displayRoleDatabase'
-    ) {
-      this.wizard.transitionFeatureMachine(this.wizard.featureState, 'CONTINUE', 'database');
-    }
     if (this.args.initialKey) {
       this.args.model.database = [this.args.initialKey];
     }
   }
 
-  @tracked loading = false;
+  isValid() {
+    const { isValid, state } = this.args.model.validate();
+    this.modelValidations = isValid ? null : state;
+    this.invalidFormAlert = 'There was an error submitting this form.';
+    return isValid;
+  }
+
+  resetErrors() {
+    this.flashMessages.clearMessages();
+    this.errorMessage = this.invalidFormAlert = '';
+    this.modelValidations = null;
+  }
 
   get warningMessages() {
-    let warnings = {};
-    if (this.args.model.canUpdateDb === false) {
-      warnings.database = `You don’t have permissions to update this database connection, so this role cannot be created.`;
-    }
+    const warnings = {};
+    const { canCreateDynamic, canCreateStatic, type } = this.args.model;
     if (
-      (this.args.model.type === 'dynamic' && this.args.model.canCreateDynamic === false) ||
-      (this.args.model.type === 'static' && this.args.model.canCreateStatic === false)
+      (type === 'dynamic' && canCreateDynamic === false) ||
+      (type === 'static' && canCreateStatic === false)
     ) {
       warnings.type = `You don't have permissions to create this type of role.`;
     }
     return warnings;
   }
-
   get databaseType() {
     const backend = this.args.model?.backend;
     const dbs = this.args.model?.database || [];
@@ -64,13 +90,13 @@ export default class DatabaseRoleEdit extends Component {
   delete() {
     const secret = this.args.model;
     const backend = secret.backend;
-    secret
+    return secret
       .destroyRecord()
       .then(() => {
         try {
           this.router.transitionTo(LIST_ROOT_ROUTE, backend, { queryParams: { tab: 'role' } });
         } catch (e) {
-          console.debug(e);
+          console.debug(e); // eslint-disable-line
         }
       })
       .catch((e) => {
@@ -78,34 +104,40 @@ export default class DatabaseRoleEdit extends Component {
       });
   }
 
-  @action
-  handleCreateEditRole(evt) {
-    evt.preventDefault();
-    this.loading = true;
+  handleCreateEditRole = task(
+    waitFor(async (evt) => {
+      evt.preventDefault();
+      this.resetErrors();
+      const { mode, model } = this.args;
+      if (!this.isValid()) return;
+      if (mode === 'create') {
+        model.id = model.name;
+        const path = model.type === 'static' ? 'static-roles' : 'roles';
+        model.path = path;
+      }
+      try {
+        await model.save();
+        this.router.transitionTo(SHOW_ROUTE, `role/${model.name}`);
+      } catch (e) {
+        this.errorMessage = errorMessage(e);
+        this.flashMessages.danger(
+          this.errorMessage || 'Could not save the role. Please check Vault logs for more information.'
+        );
+      }
+    })
+  );
 
-    const mode = this.args.mode;
-    let roleSecret = this.args.model;
-    let secretId = roleSecret.name;
-    if (mode === 'create') {
-      roleSecret.set('id', secretId);
-      let path = roleSecret.type === 'static' ? 'static-roles' : 'roles';
-      roleSecret.set('path', path);
-    }
-    roleSecret
-      .save()
+  @action
+  rotateRoleCred(id) {
+    const backend = this.args.model?.backend;
+    const adapter = this.store.adapterFor('database/credential');
+    return adapter
+      .rotateRoleCredentials(backend, id)
       .then(() => {
-        try {
-          this.router.transitionTo(SHOW_ROUTE, `role/${secretId}`);
-        } catch (e) {
-          console.debug(e);
-        }
+        this.flashMessages.success(`Success: Credentials for ${id} role were rotated`);
       })
       .catch((e) => {
-        const errorMessage = e.errors?.join('. ') || e.message;
-        this.flashMessages.danger(
-          errorMessage || 'Could not save the role. Please check Vault logs for more information.'
-        );
-        this.loading = false;
+        this.flashMessages.danger(e.errors);
       });
   }
 }

@@ -1,14 +1,13 @@
 ---
 layout: docs
-page_title: Helm - Kubernetes
+page_title: Helm chart
 description: >-
-  The Vault Helm chart is the recommended way to install and configure Vault on
-  Kubernetes.
+  Install and configure Vault on Kubernetes using the Vault Helm chart which is the recommended way.
 ---
 
-# Helm Chart
+# Helm chart
 
-~> **Important Note:** This chart is not compatible with Helm 2. Please use Helm 3 with this chart.
+@include 'helm/version.mdx'
 
 The [Vault Helm chart](https://github.com/hashicorp/vault-helm)
 is the recommended way to install and configure Vault on Kubernetes.
@@ -20,13 +19,15 @@ This page assumes general knowledge of [Helm](https://helm.sh/) and
 how to use it. Using Helm to install Vault requires that Helm is
 properly installed and configured with your Kubernetes cluster.
 
-## Using the Helm Chart
+@include 'kubernetes-supported-versions.mdx'
+
+## Using the Helm chart
 
 Helm must be installed and configured on your machine. Please refer to the [Helm
 documentation](https://helm.sh/) or the [Vault Installation to Minikube via
-Helm](https://learn.hashicorp.com/tutorials/vault/kubernetes-minikube) guide.
+Helm](/vault/tutorials/kubernetes/kubernetes-minikube-consul) tutorial.
 
-To use the Helm chart, add the Hashicorp helm repository and check that you have
+To use the Helm chart, add the Hashicorp Helm repository and check that you have
 access to the chart:
 
 @include 'helm/repo.mdx'
@@ -54,11 +55,19 @@ secure and less resilient installation that is **NOT** appropriate for a
 production setup. It is highly recommended to use a [properly secured Kubernetes
 cluster](https://kubernetes.io/docs/tasks/administer-cluster/securing-a-cluster/),
 [learn the available configuration
-options](/docs/platform/k8s/helm/configuration), and read the [production deployment
-checklist](/docs/platform/k8s/helm/run#architecture).
+options](/vault/docs/platform/k8s/helm/configuration), and read the [production deployment
+checklist](/vault/docs/platform/k8s/helm/run#architecture).
 
-## Learn
 
-Refer to the [Run Vault on
-Kubernetes](https://learn.hashicorp.com/collections/vault/kubernetes)
-guides for step-by-step tutorials.
+<Important title="Helm chart provisions ALB on AWS side">
+
+  If you use AWS features (e.g, AWS PrivateLink) that require a network load
+  balancer (NLB), you must provision your NLB **before** your application load 
+  balancer (ALB).
+
+</Important>
+
+## Tutorial
+
+Refer to the [Kubernetes](/vault/tutorials/kubernetes)
+tutorials series to learn how to run Vault on Kubernetes.

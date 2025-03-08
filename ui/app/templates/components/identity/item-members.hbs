@@ -1,6 +1,11 @@
+{{!
+  Copyright (c) HashiCorp, Inc.
+  SPDX-License-Identifier: BUSL-1.1
+~}}
+
 {{#if @model.hasMembers}}
   {{#each @model.memberGroupIds as |gid|}}
-    {{#linked-block "vault.cluster.access.identity.show" "groups" gid this.details class="list-item-row"}}
+    <LinkedBlock @params={{array "vault.cluster.access.identity.show" "groups" gid this.details}} class="list-item-row">
       <div class="columns is-mobile">
         <div class="column is-10">
           <LinkTo
@@ -13,14 +18,14 @@
         </div>
         <div class="column has-text-right">
           {{#if @model.canEdit}}
-            <Identity::PopupMembers @params={{array @model "memberGroupIds" gid}} />
+            <Identity::PopupMembers @model={{@model}} @groupArray="memberGroupIds" @memberId={{gid}} />
           {{/if}}
         </div>
       </div>
-    {{/linked-block}}
+    </LinkedBlock>
   {{/each}}
   {{#each @model.memberEntityIds as |gid|}}
-    {{#linked-block "vault.cluster.access.identity.show" "groups" gid this.details class="list-item-row"}}
+    <LinkedBlock @params={{array "vault.cluster.access.identity.show" "groups" gid this.details}} class="list-item-row">
       <div class="columns">
         <div class="column is-10">
           <LinkTo
@@ -33,11 +38,11 @@
         </div>
         <div class="column has-text-right">
           {{#if @model.canEdit}}
-            <Identity::PopupMembers @params={{array @model "memberEntityIds" gid}} />
+            <Identity::PopupMembers @model={{@model}} @groupArray="memberEntityIds" @memberId={{gid}} />
           {{/if}}
         </div>
       </div>
-    {{/linked-block}}
+    </LinkedBlock>
   {{/each}}
 {{else}}
   <EmptyState @title="No members in this group yet" />

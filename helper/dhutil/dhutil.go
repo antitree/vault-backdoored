@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package dhutil
 
 import (
@@ -6,14 +9,12 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 
-	"golang.org/x/crypto/hkdf"
-
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 type PublicKeyInfo struct {
@@ -29,14 +30,17 @@ type Envelope struct {
 // generatePublicPrivateKey uses curve25519 to generate a public and private key
 // pair.
 func GeneratePublicPrivateKey() ([]byte, []byte, error) {
-	var scalar, public [32]byte
+	scalar := make([]byte, 32)
 
-	if _, err := io.ReadFull(rand.Reader, scalar[:]); err != nil {
+	if _, err := io.ReadFull(rand.Reader, scalar); err != nil {
 		return nil, nil, err
 	}
 
-	curve25519.ScalarBaseMult(&public, &scalar)
-	return public[:], scalar[:], nil
+	public, err := curve25519.X25519(scalar, curve25519.Basepoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return public, scalar, nil
 }
 
 // GenerateSharedSecret uses the private key and the other party's public key to
@@ -90,7 +94,6 @@ func DeriveSharedKey(secret, ourPublic, theirPublic []byte) ([]byte, error) {
 	if n != 32 {
 		return nil, errors.New("short read from hkdf")
 	}
-	fmt.Printf("Key: %s\n", hex.EncodeToString(key[:]))
 
 	return key[:], nil
 }

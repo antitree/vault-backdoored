@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package postgresql
 
 import (
@@ -10,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/vault/sdk/physical"
-
-	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-uuid"
-
 	"github.com/armon/go-metrics"
-	"github.com/lib/pq"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-secure-stdlib/permitpool"
+	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
+	"github.com/hashicorp/vault/sdk/physical"
+	_ "github.com/jackc/pgx/v4/stdlib"
 )
 
 const (
@@ -37,11 +40,9 @@ const (
 // Verify PostgreSQLBackend satisfies the correct interfaces
 var _ physical.Backend = (*PostgreSQLBackend)(nil)
 
-//
 // HA backend was implemented based on the DynamoDB backend pattern
 // With distinction using central postgres clock, hereby avoiding
 // possible issues with multiple clocks
-//
 var (
 	_ physical.HABackend = (*PostgreSQLBackend)(nil)
 	_ physical.Lock      = (*PostgreSQLLock)(nil)
@@ -64,7 +65,7 @@ type PostgreSQLBackend struct {
 
 	haEnabled  bool
 	logger     log.Logger
-	permitPool *physical.PermitPool
+	permitPool *permitpool.Pool
 }
 
 // PostgreSQLLock implements a lock using an PostgreSQL client.
@@ -99,7 +100,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 	if !ok {
 		unquoted_table = "vault_kv_store"
 	}
-	quoted_table := pq.QuoteIdentifier(unquoted_table)
+	quoted_table := dbutil.QuoteIdentifier(unquoted_table)
 
 	maxParStr, ok := conf["max_parallel"]
 	var maxParInt int
@@ -129,7 +130,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 	}
 
 	// Create PostgreSQL handle for the database.
-	db, err := sql.Open("postgres", connURL)
+	db, err := sql.Open("pgx", connURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
@@ -165,7 +166,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 	if !ok {
 		unquoted_ha_table = "vault_ha_locks"
 	}
-	quoted_ha_table := pq.QuoteIdentifier(unquoted_ha_table)
+	quoted_ha_table := dbutil.QuoteIdentifier(unquoted_ha_table)
 
 	// Setup the backend.
 	m := &PostgreSQLBackend{
@@ -192,7 +193,7 @@ func NewPostgreSQLBackend(conf map[string]string, logger log.Logger) (physical.B
 		// $1=ha_identity $2=ha_key
 		" DELETE FROM " + quoted_ha_table + " WHERE ha_identity=$1 AND ha_key=$2 ",
 		logger:     logger,
-		permitPool: physical.NewPermitPool(maxParInt),
+		permitPool: permitpool.New(maxParInt),
 		haEnabled:  conf["ha_enabled"] == "true",
 	}
 
@@ -240,12 +241,14 @@ func (m *PostgreSQLBackend) splitKey(fullPath string) (string, string, string) {
 func (m *PostgreSQLBackend) Put(ctx context.Context, entry *physical.Entry) error {
 	defer metrics.MeasureSince([]string{"postgres", "put"}, time.Now())
 
-	m.permitPool.Acquire()
+	if err := m.permitPool.Acquire(ctx); err != nil {
+		return err
+	}
 	defer m.permitPool.Release()
 
 	parentPath, path, key := m.splitKey(entry.Key)
 
-	_, err := m.client.Exec(m.put_query, parentPath, path, key, entry.Value)
+	_, err := m.client.ExecContext(ctx, m.put_query, parentPath, path, key, entry.Value)
 	if err != nil {
 		return err
 	}
@@ -256,13 +259,15 @@ func (m *PostgreSQLBackend) Put(ctx context.Context, entry *physical.Entry) erro
 func (m *PostgreSQLBackend) Get(ctx context.Context, fullPath string) (*physical.Entry, error) {
 	defer metrics.MeasureSince([]string{"postgres", "get"}, time.Now())
 
-	m.permitPool.Acquire()
+	if err := m.permitPool.Acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer m.permitPool.Release()
 
 	_, path, key := m.splitKey(fullPath)
 
 	var result []byte
-	err := m.client.QueryRow(m.get_query, path, key).Scan(&result)
+	err := m.client.QueryRowContext(ctx, m.get_query, path, key).Scan(&result)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -281,12 +286,14 @@ func (m *PostgreSQLBackend) Get(ctx context.Context, fullPath string) (*physical
 func (m *PostgreSQLBackend) Delete(ctx context.Context, fullPath string) error {
 	defer metrics.MeasureSince([]string{"postgres", "delete"}, time.Now())
 
-	m.permitPool.Acquire()
+	if err := m.permitPool.Acquire(ctx); err != nil {
+		return err
+	}
 	defer m.permitPool.Release()
 
 	_, path, key := m.splitKey(fullPath)
 
-	_, err := m.client.Exec(m.delete_query, path, key)
+	_, err := m.client.ExecContext(ctx, m.delete_query, path, key)
 	if err != nil {
 		return err
 	}
@@ -298,10 +305,12 @@ func (m *PostgreSQLBackend) Delete(ctx context.Context, fullPath string) error {
 func (m *PostgreSQLBackend) List(ctx context.Context, prefix string) ([]string, error) {
 	defer metrics.MeasureSince([]string{"postgres", "list"}, time.Now())
 
-	m.permitPool.Acquire()
+	if err := m.permitPool.Acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer m.permitPool.Release()
 
-	rows, err := m.client.Query(m.list_query, "/"+prefix)
+	rows, err := m.client.QueryContext(ctx, m.list_query, "/"+prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +386,9 @@ func (l *PostgreSQLLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 // PostgreSQL table.
 func (l *PostgreSQLLock) Unlock() error {
 	pg := l.backend
-	pg.permitPool.Acquire()
+	if err := pg.permitPool.Acquire(context.Background()); err != nil {
+		return err
+	}
 	defer pg.permitPool.Release()
 
 	if l.renewTicker != nil {
@@ -393,7 +404,9 @@ func (l *PostgreSQLLock) Unlock() error {
 // including this one, and returns the current value.
 func (l *PostgreSQLLock) Value() (bool, string, error) {
 	pg := l.backend
-	pg.permitPool.Acquire()
+	if err := pg.permitPool.Acquire(context.Background()); err != nil {
+		return false, "", err
+	}
 	defer pg.permitPool.Release()
 	var result string
 	err := pg.client.QueryRow(pg.haGetLockValueQuery, l.key).Scan(&result)
@@ -453,7 +466,9 @@ func (l *PostgreSQLLock) periodicallyRenewLock(done chan struct{}) {
 // else has the lock, whereas non-nil means that something unexpected happened.
 func (l *PostgreSQLLock) writeItem() (bool, error) {
 	pg := l.backend
-	pg.permitPool.Acquire()
+	if err := pg.permitPool.Acquire(context.Background()); err != nil {
+		return false, err
+	}
 	defer pg.permitPool.Release()
 
 	// Try steal lock or update expiry on my lock

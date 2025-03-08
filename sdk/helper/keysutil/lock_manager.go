@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package keysutil
 
 import (
@@ -36,6 +39,9 @@ type PolicyRequest struct {
 	// The key type
 	KeyType KeyType
 
+	// The key size for variable key size algorithms
+	KeySize int
+
 	// Whether it should be derived
 	Derived bool
 
@@ -52,7 +58,27 @@ type PolicyRequest struct {
 	AllowPlaintextBackup bool
 
 	// How frequently the key should automatically rotate
-	AutoRotateInterval time.Duration
+	AutoRotatePeriod time.Duration
+
+	// AllowImportedKeyRotation indicates whether an imported key may be rotated by Vault
+	AllowImportedKeyRotation bool
+
+	// Indicates whether a private or public key is imported/upserted
+	IsPrivateKey bool
+
+	// The UUID of the managed key, if using one
+	ManagedKeyUUID string
+
+	// ParameterSet indicates the parameter set to use with ML-DSA and SLH-DSA keys
+	ParameterSet string
+
+	// HybridConfig contains the key types and parameters for hybrid keys
+	HybridConfig HybridKeyConfig
+}
+
+type HybridKeyConfig struct {
+	PQCKeyType KeyType
+	ECKeyType  KeyType
 }
 
 type LockManager struct {
@@ -251,12 +277,12 @@ func (lm *LockManager) BackupPolicy(ctx context.Context, storage logical.Storage
 			return "", err
 		}
 		if p == nil {
-			return "", fmt.Errorf(fmt.Sprintf("key %q not found", name))
+			return "", fmt.Errorf("key %q not found", name)
 		}
 	}
 
 	if atomic.LoadUint32(&p.deleted) == 1 {
-		return "", fmt.Errorf(fmt.Sprintf("key %q not found", name))
+		return "", fmt.Errorf("key %q not found", name)
 	}
 
 	backup, err := p.Backup(ctx, storage)
@@ -370,6 +396,35 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest, rand io
 				cleanup()
 				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
 			}
+		case KeyType_HMAC:
+			if req.Derived || req.Convergent {
+				cleanup()
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
+		case KeyType_MANAGED_KEY:
+			if req.Derived || req.Convergent {
+				cleanup()
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
+		case KeyType_AES128_CMAC, KeyType_AES256_CMAC:
+			if req.Derived || req.Convergent {
+				cleanup()
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
+		case KeyType_ML_DSA:
+			if req.Derived || req.Convergent {
+				cleanup()
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
+		case KeyType_HYBRID:
+			if req.Derived || req.Convergent {
+				cleanup()
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
 
 		default:
 			cleanup()
@@ -383,7 +438,10 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest, rand io
 			Derived:              req.Derived,
 			Exportable:           req.Exportable,
 			AllowPlaintextBackup: req.AllowPlaintextBackup,
-			AutoRotateInterval:   req.AutoRotateInterval,
+			AutoRotatePeriod:     req.AutoRotatePeriod,
+			KeySize:              req.KeySize,
+			ParameterSet:         req.ParameterSet,
+			HybridConfig:         req.HybridConfig,
 		}
 
 		if req.Derived {
@@ -400,7 +458,11 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest, rand io
 		}
 
 		// Performs the actual persist and does setup
-		err = p.Rotate(ctx, req.Storage, rand)
+		if p.Type == KeyType_MANAGED_KEY {
+			err = p.RotateManagedKey(ctx, req.Storage, req.ManagedKeyUUID)
+		} else {
+			err = p.Rotate(ctx, req.Storage, rand)
+		}
 		if err != nil {
 			cleanup()
 			return nil, false, err
@@ -437,6 +499,62 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest, rand io
 	retP = p
 	cleanup()
 	return
+}
+
+func (lm *LockManager) ImportPolicy(ctx context.Context, req PolicyRequest, key []byte, rand io.Reader) error {
+	var p *Policy
+	var err error
+	var ok bool
+	var pRaw interface{}
+
+	// Check if it's in our cache
+	if lm.useCache {
+		pRaw, ok = lm.cache.Load(req.Name)
+	}
+	if ok {
+		p = pRaw.(*Policy)
+		if atomic.LoadUint32(&p.deleted) == 1 {
+			return nil
+		}
+	}
+
+	// We're not using the cache, or it wasn't found; get an exclusive lock.
+	// This ensures that any other process writing the actual storage will be
+	// finished before we load from storage.
+	lock := locksutil.LockForKey(lm.keyLocks, req.Name)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Load it from storage
+	p, err = lm.getPolicyFromStorage(ctx, req.Storage, req.Name)
+	if err != nil {
+		return err
+	}
+
+	if p == nil {
+		p = &Policy{
+			l:                        new(sync.RWMutex),
+			Name:                     req.Name,
+			Type:                     req.KeyType,
+			Derived:                  req.Derived,
+			Exportable:               req.Exportable,
+			AllowPlaintextBackup:     req.AllowPlaintextBackup,
+			AutoRotatePeriod:         req.AutoRotatePeriod,
+			AllowImportedKeyRotation: req.AllowImportedKeyRotation,
+			Imported:                 true,
+		}
+	}
+
+	err = p.ImportPublicOrPrivate(ctx, req.Storage, key, req.IsPrivateKey, rand)
+	if err != nil {
+		return fmt.Errorf("error importing key: %s", err)
+	}
+
+	if lm.useCache {
+		lm.cache.Store(req.Name, p)
+	}
+
+	return nil
 }
 
 func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage, name string) error {

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package awsauth
 
 import (
@@ -9,7 +12,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -18,15 +21,18 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	awsClient "github.com/aws/aws-sdk-go/aws/client"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/iam"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/hashicorp/errwrap"
-	cleanhttp "github.com/hashicorp/go-cleanhttp"
+	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/hashicorp/go-secure-stdlib/awsutil"
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
-	uuid "github.com/hashicorp/go-uuid"
-	"github.com/hashicorp/vault/builtin/credential/aws/pkcs7"
+	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/vault/helper/pkcs7"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/cidrutil"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
@@ -52,6 +58,10 @@ var (
 func (b *backend) pathLogin() *framework.Path {
 	return &framework.Path{
 		Pattern: "login$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixAWS,
+			OperationVerb:   "login",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"role": {
 				Type: framework.TypeString,
@@ -86,7 +96,7 @@ significance.`,
 				Type: framework.TypeString,
 				Description: `HTTP method to use for the AWS request when auth_type is
 iam. This must match what has been signed in the
-presigned request. Currently, POST is the only supported value`,
+presigned request.`,
 			},
 
 			"iam_request_url": {
@@ -103,8 +113,8 @@ This must match the request body included in the signature.`,
 			"iam_request_headers": {
 				Type: framework.TypeHeader,
 				Description: `Key/value pairs of headers for use in the
-sts:GetCallerIdentity HTTP requests headers when auth_type is iam. Can be either 
-a Base64-encoded, JSON-serialized string, or a JSON object of key/value pairs. 
+sts:GetCallerIdentity HTTP requests headers when auth_type is iam. Can be either
+a Base64-encoded, JSON-serialized string, or a JSON object of key/value pairs.
 This must at a minimum include the headers over which AWS has included a  signature.`,
 			},
 			"identity": {
@@ -128,6 +138,9 @@ needs to be supplied along with 'identity' parameter.`,
 			logical.AliasLookaheadOperation: &framework.PathOperation{
 				Callback: b.pathLoginUpdate,
 			},
+			logical.ResolveRoleOperation: &framework.PathOperation{
+				Callback: b.pathLoginResolveRole,
+			},
 		},
 
 		HelpSynopsis:    pathLoginSyn,
@@ -135,9 +148,224 @@ needs to be supplied along with 'identity' parameter.`,
 	}
 }
 
+func (b *backend) pathLoginResolveRole(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	anyEc2, allEc2 := hasValuesForEc2Auth(data)
+	anyIam, allIam := hasValuesForIamAuth(data)
+	switch {
+	case anyEc2 && anyIam:
+		return logical.ErrorResponse("supplied auth values for both ec2 and iam auth types"), nil
+	case anyEc2 && !allEc2:
+		return logical.ErrorResponse("supplied some of the auth values for the ec2 auth type but not all"), nil
+	case anyEc2:
+		return b.pathLoginResolveRoleEc2(ctx, req, data)
+	case anyIam && !allIam:
+		return logical.ErrorResponse("supplied some of the auth values for the iam auth type but not all"), nil
+	case anyIam:
+		return b.pathLoginResolveRoleIam(ctx, req, data)
+	default:
+		return logical.ErrorResponse("didn't supply required authentication values"), nil
+	}
+}
+
+func (b *backend) pathLoginEc2GetRoleNameAndIdentityDoc(ctx context.Context, req *logical.Request, data *framework.FieldData) (string, *identityDocument, *logical.Response, error) {
+	identityDocB64 := data.Get("identity").(string)
+	var identityDocBytes []byte
+	var err error
+	if identityDocB64 != "" {
+		identityDocBytes, err = base64.StdEncoding.DecodeString(identityDocB64)
+		if err != nil || len(identityDocBytes) == 0 {
+			return "", nil, logical.ErrorResponse("failed to base64 decode the instance identity document"), nil
+		}
+	}
+
+	signatureB64 := data.Get("signature").(string)
+	var signatureBytes []byte
+	if signatureB64 != "" {
+		signatureBytes, err = base64.StdEncoding.DecodeString(signatureB64)
+		if err != nil {
+			return "", nil, logical.ErrorResponse("failed to base64 decode the SHA256 RSA signature of the instance identity document"), nil
+		}
+	}
+
+	pkcs7B64 := data.Get("pkcs7").(string)
+
+	// Either the pkcs7 signature of the instance identity document, or
+	// the identity document itself along with its SHA256 RSA signature
+	// needs to be provided.
+	if pkcs7B64 == "" && (len(identityDocBytes) == 0 && len(signatureBytes) == 0) {
+		return "", nil, logical.ErrorResponse("either pkcs7 or a tuple containing the instance identity document and its SHA256 RSA signature needs to be provided"), nil
+	} else if pkcs7B64 != "" && (len(identityDocBytes) != 0 && len(signatureBytes) != 0) {
+		return "", nil, logical.ErrorResponse("both pkcs7 and a tuple containing the instance identity document and its SHA256 RSA signature is supplied; provide only one"), nil
+	}
+
+	// Verify the signature of the identity document and unmarshal it
+	var identityDocParsed *identityDocument
+	if pkcs7B64 != "" {
+		identityDocParsed, err = b.parseIdentityDocument(ctx, req.Storage, pkcs7B64)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		if identityDocParsed == nil {
+			return "", nil, logical.ErrorResponse("failed to verify the instance identity document using pkcs7"), nil
+		}
+	} else {
+		identityDocParsed, err = b.verifyInstanceIdentitySignature(ctx, req.Storage, identityDocBytes, signatureBytes)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		if identityDocParsed == nil {
+			return "", nil, logical.ErrorResponse("failed to verify the instance identity document using the SHA256 RSA digest"), nil
+		}
+	}
+
+	roleName := data.Get("role").(string)
+
+	// If roleName is not supplied, a role in the name of the instance's AMI ID will be looked for
+	if roleName == "" {
+		roleName = identityDocParsed.AmiID
+	}
+
+	// Get the entry for the role used by the instance
+	// Note that we don't return the roleEntry, but use it to determine if the role exists
+	// roleEntry does not contain the role name, so it is not appropriate to return
+	roleEntry, err := b.role(ctx, req.Storage, roleName)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if roleEntry == nil {
+		return "", nil, logical.ErrorResponse(fmt.Sprintf("entry for role %q not found", roleName)), nil
+	}
+	return roleName, identityDocParsed, nil, nil
+}
+
+func (b *backend) pathLoginResolveRoleEc2(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	role, _, resp, err := b.pathLoginEc2GetRoleNameAndIdentityDoc(ctx, req, data)
+	if resp != nil || err != nil {
+		return resp, err
+	}
+	return logical.ResolveRoleResponse(role)
+}
+
+func (b *backend) pathLoginIamGetRoleNameCallerIdAndEntity(ctx context.Context, req *logical.Request, data *framework.FieldData) (string, *GetCallerIdentityResult, *iamEntity, *logical.Response, error) {
+	method := data.Get("iam_http_request_method").(string)
+	if method == "" {
+		return "", nil, nil, logical.ErrorResponse("missing iam_http_request_method"), nil
+	}
+
+	if method != http.MethodGet && method != http.MethodPost {
+		return "", nil, nil, logical.ErrorResponse("invalid iam_http_request_method; currently only 'GET' and 'POST' are supported"), nil
+	}
+
+	rawUrlB64 := data.Get("iam_request_url").(string)
+	if rawUrlB64 == "" {
+		return "", nil, nil, logical.ErrorResponse("missing iam_request_url"), nil
+	}
+	rawUrl, err := base64.StdEncoding.DecodeString(rawUrlB64)
+	if err != nil {
+		return "", nil, nil, logical.ErrorResponse("failed to base64 decode iam_request_url"), nil
+	}
+	parsedUrl, err := url.Parse(string(rawUrl))
+	if err != nil {
+		return "", nil, nil, logical.ErrorResponse("error parsing iam_request_url"), nil
+	}
+	if err = validateLoginIamRequestUrl(method, parsedUrl); err != nil {
+		return "", nil, nil, logical.ErrorResponse(err.Error()), nil
+	}
+	bodyB64 := data.Get("iam_request_body").(string)
+	if bodyB64 == "" && method != http.MethodGet {
+		return "", nil, nil, logical.ErrorResponse("missing iam_request_body which is required for POST requests"), nil
+	}
+	bodyRaw, err := base64.StdEncoding.DecodeString(bodyB64)
+	if err != nil {
+		return "", nil, nil, logical.ErrorResponse("failed to base64 decode iam_request_body"), nil
+	}
+	body := string(bodyRaw)
+	if err = validateLoginIamRequestBody(body); err != nil {
+		return "", nil, nil, logical.ErrorResponse(err.Error()), nil
+	}
+
+	headers := data.Get("iam_request_headers").(http.Header)
+	if len(headers) == 0 {
+		return "", nil, nil, logical.ErrorResponse("missing iam_request_headers"), nil
+	}
+
+	config, err := b.lockedClientConfigEntry(ctx, req.Storage)
+	if err != nil {
+		return "", nil, nil, nil, fmt.Errorf("error getting configuration: %w", err)
+	}
+
+	endpoint := "https://sts.amazonaws.com"
+
+	maxRetries := awsClient.DefaultRetryerMaxNumRetries
+	if config != nil {
+		if config.IAMServerIdHeaderValue != "" {
+			err = validateVaultHeaderValue(method, headers, parsedUrl, config.IAMServerIdHeaderValue)
+			if err != nil {
+				return "", nil, nil, logical.ErrorResponse(fmt.Sprintf("error validating %s header: %v", iamServerIdHeader, err)), nil
+			}
+		}
+		if err = config.validateAllowedSTSHeaderValues(headers); err != nil {
+			return "", nil, nil, logical.ErrorResponse(err.Error()), nil
+		}
+		if method == http.MethodGet {
+			if err = config.validateAllowedSTSQueryValues(parsedUrl.Query()); err != nil {
+				return "", nil, nil, logical.ErrorResponse(err.Error()), nil
+			}
+		}
+		if config.STSEndpoint != "" {
+			endpoint = config.STSEndpoint
+		}
+		if config.MaxRetries >= 0 {
+			maxRetries = config.MaxRetries
+		}
+
+		// Extract and use a regional STS endpoint
+		// based on the region set in the Authorization header.
+		if config.UseSTSRegionFromClient {
+			clientSpecifiedRegion, err := awsRegionFromHeader(headers.Get("Authorization"))
+			if err != nil {
+				return "", nil, nil, logical.ErrorResponse("region missing from Authorization header"), nil
+			}
+
+			url, err := stsRegionalEndpoint(clientSpecifiedRegion)
+			if err != nil {
+				return "", nil, nil, logical.ErrorResponse(err.Error()), nil
+			}
+
+			b.Logger().Debug("use_sts_region_from_client set; using region specified from header", "region", clientSpecifiedRegion)
+			endpoint = url
+		}
+	}
+
+	b.Logger().Debug("submitting caller identity request", "endpoint", endpoint)
+	callerID, err := submitCallerIdentityRequest(ctx, maxRetries, method, endpoint, parsedUrl, body, headers)
+	if err != nil {
+		return "", nil, nil, logical.ErrorResponse(fmt.Sprintf("error making upstream request: %v", err)), nil
+	}
+
+	entity, err := parseIamArn(callerID.Arn)
+	if err != nil {
+		return "", nil, nil, logical.ErrorResponse(fmt.Sprintf("error parsing arn %q: %v", callerID.Arn, err)), nil
+	}
+
+	roleName := data.Get("role").(string)
+	if roleName == "" {
+		roleName = entity.FriendlyName
+	}
+	return roleName, callerID, entity, nil, nil
+}
+
+func (b *backend) pathLoginResolveRoleIam(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	role, _, _, resp, err := b.pathLoginIamGetRoleNameCallerIdAndEntity(ctx, req, data)
+	if resp != nil || err != nil {
+		return resp, err
+	}
+	return logical.ResolveRoleResponse(role)
+}
+
 // instanceIamRoleARN fetches the IAM role ARN associated with the given
 // instance profile name
-func (b *backend) instanceIamRoleARN(iamClient *iam.IAM, instanceProfileName string) (string, error) {
+func (b *backend) instanceIamRoleARN(ctx context.Context, iamClient *iam.IAM, instanceProfileName string) (string, error) {
 	if iamClient == nil {
 		return "", fmt.Errorf("nil iamClient")
 	}
@@ -145,7 +373,7 @@ func (b *backend) instanceIamRoleARN(iamClient *iam.IAM, instanceProfileName str
 		return "", fmt.Errorf("missing instance profile name")
 	}
 
-	profile, err := iamClient.GetInstanceProfile(&iam.GetInstanceProfileInput{
+	profile, err := iamClient.GetInstanceProfileWithContext(ctx, &iam.GetInstanceProfileInput{
 		InstanceProfileName: aws.String(instanceProfileName),
 	})
 	if err != nil {
@@ -179,7 +407,7 @@ func (b *backend) validateInstance(ctx context.Context, s logical.Storage, insta
 		return nil, err
 	}
 
-	status, err := ec2Client.DescribeInstances(&ec2.DescribeInstancesInput{
+	status, err := ec2Client.DescribeInstancesWithContext(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []*string{
 			aws.String(instanceID),
 		},
@@ -521,7 +749,7 @@ func (b *backend) verifyInstanceMeetsRoleRequirements(ctx context.Context,
 		} else if iamClient == nil {
 			return nil, fmt.Errorf("received a nil iamClient")
 		}
-		iamRoleARN, err := b.instanceIamRoleARN(iamClient, iamInstanceProfileEntity.FriendlyName)
+		iamRoleARN, err := b.instanceIamRoleARN(ctx, iamClient, iamInstanceProfileEntity.FriendlyName)
 		if err != nil {
 			return nil, fmt.Errorf("IAM role ARN could not be fetched: %w", err)
 		}
@@ -554,61 +782,9 @@ func (b *backend) verifyInstanceMeetsRoleRequirements(ctx context.Context,
 // and a client created nonce. Client nonce is optional if 'disallow_reauthentication'
 // option is enabled on the registered role.
 func (b *backend) pathLoginUpdateEc2(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	identityDocB64 := data.Get("identity").(string)
-	var identityDocBytes []byte
-	var err error
-	if identityDocB64 != "" {
-		identityDocBytes, err = base64.StdEncoding.DecodeString(identityDocB64)
-		if err != nil || len(identityDocBytes) == 0 {
-			return logical.ErrorResponse("failed to base64 decode the instance identity document"), nil
-		}
-	}
-
-	signatureB64 := data.Get("signature").(string)
-	var signatureBytes []byte
-	if signatureB64 != "" {
-		signatureBytes, err = base64.StdEncoding.DecodeString(signatureB64)
-		if err != nil {
-			return logical.ErrorResponse("failed to base64 decode the SHA256 RSA signature of the instance identity document"), nil
-		}
-	}
-
-	pkcs7B64 := data.Get("pkcs7").(string)
-
-	// Either the pkcs7 signature of the instance identity document, or
-	// the identity document itself along with its SHA256 RSA signature
-	// needs to be provided.
-	if pkcs7B64 == "" && (len(identityDocBytes) == 0 && len(signatureBytes) == 0) {
-		return logical.ErrorResponse("either pkcs7 or a tuple containing the instance identity document and its SHA256 RSA signature needs to be provided"), nil
-	} else if pkcs7B64 != "" && (len(identityDocBytes) != 0 && len(signatureBytes) != 0) {
-		return logical.ErrorResponse("both pkcs7 and a tuple containing the instance identity document and its SHA256 RSA signature is supplied; provide only one"), nil
-	}
-
-	// Verify the signature of the identity document and unmarshal it
-	var identityDocParsed *identityDocument
-	if pkcs7B64 != "" {
-		identityDocParsed, err = b.parseIdentityDocument(ctx, req.Storage, pkcs7B64)
-		if err != nil {
-			return nil, err
-		}
-		if identityDocParsed == nil {
-			return logical.ErrorResponse("failed to verify the instance identity document using pkcs7"), nil
-		}
-	} else {
-		identityDocParsed, err = b.verifyInstanceIdentitySignature(ctx, req.Storage, identityDocBytes, signatureBytes)
-		if err != nil {
-			return nil, err
-		}
-		if identityDocParsed == nil {
-			return logical.ErrorResponse("failed to verify the instance identity document using the SHA256 RSA digest"), nil
-		}
-	}
-
-	roleName := data.Get("role").(string)
-
-	// If roleName is not supplied, a role in the name of the instance's AMI ID will be looked for
-	if roleName == "" {
-		roleName = identityDocParsed.AmiID
+	roleName, identityDocParsed, errResp, err := b.pathLoginEc2GetRoleNameAndIdentityDoc(ctx, req, data)
+	if errResp != nil || err != nil {
+		return errResp, err
 	}
 
 	// Get the entry for the role used by the instance
@@ -1136,7 +1312,7 @@ func (b *backend) pathLoginRenewEc2(ctx context.Context, req *logical.Request, _
 	// If the login was made using the role tag, then max_ttl from tag
 	// is cached in internal data during login and used here to cap the
 	// max_ttl of renewal.
-	rTagMaxTTL, err := time.ParseDuration(req.Auth.Metadata["role_tag_max_ttl"])
+	rTagMaxTTL, err := parseutil.ParseDurationSecond(req.Auth.Metadata["role_tag_max_ttl"])
 	if err != nil {
 		return nil, err
 	}
@@ -1176,92 +1352,9 @@ func (b *backend) pathLoginRenewEc2(ctx context.Context, req *logical.Request, _
 }
 
 func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	method := data.Get("iam_http_request_method").(string)
-	if method == "" {
-		return logical.ErrorResponse("missing iam_http_request_method"), nil
-	}
-
-	// In the future, might consider supporting GET
-	if method != "POST" {
-		return logical.ErrorResponse("invalid iam_http_request_method; currently only 'POST' is supported"), nil
-	}
-
-	rawUrlB64 := data.Get("iam_request_url").(string)
-	if rawUrlB64 == "" {
-		return logical.ErrorResponse("missing iam_request_url"), nil
-	}
-	rawUrl, err := base64.StdEncoding.DecodeString(rawUrlB64)
-	if err != nil {
-		return logical.ErrorResponse("failed to base64 decode iam_request_url"), nil
-	}
-	parsedUrl, err := url.Parse(string(rawUrl))
-	if err != nil {
-		return logical.ErrorResponse("error parsing iam_request_url"), nil
-	}
-	if parsedUrl.RawQuery != "" {
-		// Should be no query parameters
-		return logical.ErrorResponse(logical.ErrInvalidRequest.Error()), nil
-	}
-	// TODO: There are two potentially valid cases we're not yet supporting that would
-	// necessitate this check being changed. First, if we support GET requests.
-	// Second if we support presigned POST requests
-	bodyB64 := data.Get("iam_request_body").(string)
-	if bodyB64 == "" {
-		return logical.ErrorResponse("missing iam_request_body"), nil
-	}
-	bodyRaw, err := base64.StdEncoding.DecodeString(bodyB64)
-	if err != nil {
-		return logical.ErrorResponse("failed to base64 decode iam_request_body"), nil
-	}
-	body := string(bodyRaw)
-	if err = validateLoginIamRequestBody(body); err != nil {
-		return logical.ErrorResponse(err.Error()), nil
-	}
-
-	headers := data.Get("iam_request_headers").(http.Header)
-	if len(headers) == 0 {
-		return logical.ErrorResponse("missing iam_request_headers"), nil
-	}
-
-	config, err := b.lockedClientConfigEntry(ctx, req.Storage)
-	if err != nil {
-		return logical.ErrorResponse("error getting configuration"), nil
-	}
-
-	endpoint := "https://sts.amazonaws.com"
-
-	maxRetries := awsClient.DefaultRetryerMaxNumRetries
-	if config != nil {
-		if config.IAMServerIdHeaderValue != "" {
-			err = validateVaultHeaderValue(headers, parsedUrl, config.IAMServerIdHeaderValue)
-			if err != nil {
-				return logical.ErrorResponse(fmt.Sprintf("error validating %s header: %v", iamServerIdHeader, err)), nil
-			}
-		}
-		if err = config.validateAllowedSTSHeaderValues(headers); err != nil {
-			return logical.ErrorResponse(err.Error()), nil
-		}
-		if config.STSEndpoint != "" {
-			endpoint = config.STSEndpoint
-		}
-		if config.MaxRetries >= 0 {
-			maxRetries = config.MaxRetries
-		}
-	}
-
-	callerID, err := submitCallerIdentityRequest(ctx, maxRetries, method, endpoint, parsedUrl, body, headers)
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("error making upstream request: %v", err)), nil
-	}
-
-	entity, err := parseIamArn(callerID.Arn)
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("error parsing arn %q: %v", callerID.Arn, err)), nil
-	}
-
-	roleName := data.Get("role").(string)
-	if roleName == "" {
-		roleName = entity.FriendlyName
+	roleName, callerID, entity, errResp, err := b.pathLoginIamGetRoleNameCallerIdAndEntity(ctx, req, data)
+	if errResp != nil || err != nil {
+		return errResp, err
 	}
 
 	roleEntry, err := b.role(ctx, req.Storage, roleName)
@@ -1303,6 +1396,8 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 		identityAlias = callerUniqueId
 	case identityAliasIAMFullArn:
 		identityAlias = callerID.Arn
+	case identityAliasIAMCanonicalArn:
+		identityAlias = entity.canonicalArn()
 	}
 
 	// If we're just looking up for MFA, return the Alias info
@@ -1361,6 +1456,7 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 
 	inferredEntityType := ""
 	inferredEntityID := ""
+	inferredHostname := ""
 	if roleEntry.InferredEntityType == ec2EntityType {
 		instance, err := b.validateInstance(ctx, req.Storage, entity.SessionInfo, roleEntry.InferredAWSRegion, callerID.Account)
 		if err != nil {
@@ -1387,6 +1483,7 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 
 		inferredEntityType = ec2EntityType
 		inferredEntityID = entity.SessionInfo
+		inferredHostname = *instance.PrivateDnsName
 	}
 
 	auth := &logical.Auth{
@@ -1401,12 +1498,18 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 			"inferred_entity_id":  inferredEntityID,
 			"inferred_aws_region": roleEntry.InferredAWSRegion,
 			"account_id":          entity.AccountNumber,
+			"inferred_hostname":   inferredHostname,
 		},
 		DisplayName: entity.FriendlyName,
 		Alias: &logical.Alias{
 			Name: identityAlias,
 		},
 	}
+
+	if entity.Type == "assumed-role" {
+		auth.DisplayName = strings.Join([]string{entity.FriendlyName, entity.SessionInfo}, "/")
+	}
+
 	roleEntry.PopulateTokenAuth(auth)
 	if err := identityConfigEntry.IAMAuthMetadataHandler.PopulateDesiredMetadata(auth, map[string]string{
 		"client_arn":           callerID.Arn,
@@ -1417,6 +1520,7 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 		"inferred_entity_id":   inferredEntityID,
 		"inferred_aws_region":  roleEntry.InferredAWSRegion,
 		"account_id":           entity.AccountNumber,
+		"inferred_hostname":    inferredHostname,
 	}); err != nil {
 		b.Logger().Warn(fmt.Sprintf("unable to set alias metadata due to %s", err))
 	}
@@ -1433,6 +1537,31 @@ func hasWildcardBind(boundIamPrincipalARNs []string) bool {
 		}
 	}
 	return false
+}
+
+// Validate that the iam_request_url passed is valid for the STS request
+func validateLoginIamRequestUrl(method string, parsedUrl *url.URL) error {
+	switch method {
+	case http.MethodGet:
+		actions := map[string][]string(parsedUrl.Query())["Action"]
+		if len(actions) == 0 {
+			return fmt.Errorf("no action found in request")
+		}
+		if len(actions) != 1 {
+			return fmt.Errorf("found multiple actions")
+		}
+		if actions[0] != "GetCallerIdentity" {
+			return fmt.Errorf("unexpected action parameter, %s", actions[0])
+		}
+		return nil
+	case http.MethodPost:
+		if parsedUrl.RawQuery != "" {
+			return logical.ErrInvalidRequest
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported method, %s", method)
+	}
 }
 
 // Validate that the iam_request_body passed is valid for the STS request
@@ -1471,11 +1600,11 @@ func hasValuesForEc2Auth(data *framework.FieldData) (bool, bool) {
 }
 
 func hasValuesForIamAuth(data *framework.FieldData) (bool, bool) {
-	_, hasRequestMethod := data.GetOk("iam_http_request_method")
+	method, hasRequestMethod := data.GetOk("iam_http_request_method")
 	_, hasRequestURL := data.GetOk("iam_request_url")
 	_, hasRequestBody := data.GetOk("iam_request_body")
 	_, hasRequestHeaders := data.GetOk("iam_request_headers")
-	return (hasRequestMethod && hasRequestURL && hasRequestBody && hasRequestHeaders),
+	return (hasRequestMethod && hasRequestURL && (method == http.MethodGet || hasRequestBody) && hasRequestHeaders),
 		(hasRequestMethod || hasRequestURL || hasRequestBody || hasRequestHeaders)
 }
 
@@ -1529,7 +1658,7 @@ func parseIamArn(iamArn string) (*iamEntity, error) {
 	return &entity, nil
 }
 
-func validateVaultHeaderValue(headers http.Header, _ *url.URL, requiredHeaderValue string) error {
+func validateVaultHeaderValue(method string, headers http.Header, parsedUrl *url.URL, requiredHeaderValue string) error {
 	providedValue := ""
 	for k, v := range headers {
 		if strings.EqualFold(iamServerIdHeader, k) {
@@ -1545,25 +1674,29 @@ func validateVaultHeaderValue(headers http.Header, _ *url.URL, requiredHeaderVal
 	if providedValue != requiredHeaderValue {
 		return fmt.Errorf("expected %q but got %q", requiredHeaderValue, providedValue)
 	}
-
-	if authzHeaders, ok := headers["Authorization"]; ok {
-		// authzHeader looks like AWS4-HMAC-SHA256 Credential=AKI..., SignedHeaders=host;x-amz-date;x-vault-awsiam-id, Signature=...
-		// We need to extract out the SignedHeaders
-		re := regexp.MustCompile(".*SignedHeaders=([^,]+)")
-		authzHeader := strings.Join(authzHeaders, ",")
-		matches := re.FindSubmatch([]byte(authzHeader))
-		if len(matches) < 1 {
-			return fmt.Errorf("vault header wasn't signed")
+	switch method {
+	case http.MethodPost:
+		if authzHeaders, ok := headers["Authorization"]; ok {
+			// authzHeader looks like AWS4-HMAC-SHA256 Credential=AKI..., SignedHeaders=host;x-amz-date;x-vault-awsiam-id, Signature=...
+			// We need to extract out the SignedHeaders
+			re := regexp.MustCompile(".*SignedHeaders=([^,]+)")
+			authzHeader := strings.Join(authzHeaders, ",")
+			matches := re.FindSubmatch([]byte(authzHeader))
+			if len(matches) < 1 {
+				return fmt.Errorf("vault header wasn't signed")
+			}
+			if len(matches) > 2 {
+				return fmt.Errorf("found multiple SignedHeaders components")
+			}
+			signedHeaders := string(matches[1])
+			return ensureHeaderIsSigned(signedHeaders, iamServerIdHeader)
 		}
-		if len(matches) > 2 {
-			return fmt.Errorf("found multiple SignedHeaders components")
-		}
-		signedHeaders := string(matches[1])
-		return ensureHeaderIsSigned(signedHeaders, iamServerIdHeader)
+		return fmt.Errorf("missing Authorization header")
+	case http.MethodGet:
+		return ensureHeaderIsSigned(parsedUrl.Query().Get(amzSignedHeaders), iamServerIdHeader)
+	default:
+		return fmt.Errorf("unsupported method, %s", method)
 	}
-	// TODO: If we support GET requests, then we need to parse the X-Amz-SignedHeaders
-	// argument out of the query string and search in there for the header value
-	return fmt.Errorf("missing Authorization header")
 }
 
 func buildHttpRequest(method, endpoint string, parsedUrl *url.URL, body string, headers http.Header) *http.Request {
@@ -1670,7 +1803,7 @@ func submitCallerIdentityRequest(ctx context.Context, maxRetries int, method, en
 	}
 
 	// we check for status code afterwards to also print out response body
-	responseBody, err := ioutil.ReadAll(response.Body)
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -1762,7 +1895,7 @@ func (b *backend) fullArn(ctx context.Context, e *iamEntity, s logical.Storage) 
 		input := iam.GetUserInput{
 			UserName: aws.String(e.FriendlyName),
 		}
-		resp, err := client.GetUser(&input)
+		resp, err := client.GetUserWithContext(ctx, &input)
 		if err != nil {
 			return "", fmt.Errorf("error fetching user %q: %w", e.FriendlyName, err)
 		}
@@ -1776,7 +1909,7 @@ func (b *backend) fullArn(ctx context.Context, e *iamEntity, s logical.Storage) 
 		input := iam.GetRoleInput{
 			RoleName: aws.String(e.FriendlyName),
 		}
-		resp, err := client.GetRole(&input)
+		resp, err := client.GetRoleWithContext(ctx, &input)
 		if err != nil {
 			return "", fmt.Errorf("error fetching role %q: %w", e.FriendlyName, err)
 		}
@@ -1804,6 +1937,43 @@ func getMetadataValue(fromAuth *logical.Auth, forKey string) (string, error) {
 		return val, nil
 	}
 	return "", fmt.Errorf("%q not found in auth metadata", forKey)
+}
+
+func awsRegionFromHeader(authorizationHeader string) (string, error) {
+	// https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html
+	// The Authorization header takes the following form.
+	//  Authorization: AWS4-HMAC-SHA256
+	//	Credential=AKIAIOSFODNN7EXAMPLE/20230719/us-east-1/sts/aws4_request,
+	// 	SignedHeaders=content-length;content-type;host;x-amz-date,
+	//	Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024
+	//
+	// The credential is in the form of "<your-access-key-id>/<date>/<aws-region>/<aws-service>/aws4_request"
+	fields := strings.Split(authorizationHeader, " ")
+	for _, field := range fields {
+		if strings.HasPrefix(field, "Credential=") {
+			fields := strings.Split(field, "/")
+			if len(fields) < 3 {
+				return "", fmt.Errorf("invalid header format")
+			}
+
+			region := fields[2]
+			return region, nil
+		}
+	}
+
+	return "", fmt.Errorf("invalid header format")
+}
+
+func stsRegionalEndpoint(region string) (string, error) {
+	stsService := sts.EndpointsID
+	resolver := endpoints.DefaultResolver()
+	resolvedEndpoint, err := resolver.EndpointFor(stsService, region,
+		endpoints.STSRegionalEndpointOption,
+		endpoints.StrictMatchingOption)
+	if err != nil {
+		return "", fmt.Errorf("unable to get regional STS endpoint for region: %v", region)
+	}
+	return resolvedEndpoint.URL, nil
 }
 
 const iamServerIdHeader = "X-Vault-AWS-IAM-Server-ID"

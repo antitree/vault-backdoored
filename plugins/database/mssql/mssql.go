@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package mssql
 
 import (
@@ -11,7 +14,6 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/go-secure-stdlib/strutil"
-
 	"github.com/hashicorp/vault/sdk/database/dbplugin/v5"
 	"github.com/hashicorp/vault/sdk/database/helper/connutil"
 	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
@@ -154,7 +156,7 @@ func (m *MSSQL) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (dbplu
 				"expiration": expirationStr,
 			}
 
-			if err := dbtxn.ExecuteTxQuery(ctx, tx, m, query); err != nil {
+			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
 				return dbplugin.NewUserResponse{}, err
 			}
 		}
@@ -198,7 +200,7 @@ func (m *MSSQL) DeleteUser(ctx context.Context, req dbplugin.DeleteUserRequest) 
 			m := map[string]string{
 				"name": req.Username,
 			}
-			if err := dbtxn.ExecuteDBQuery(ctx, db, m, query); err != nil {
+			if err := dbtxn.ExecuteDBQueryDirect(ctx, db, m, query); err != nil {
 				merr = multierror.Append(merr, err)
 			}
 		}
@@ -283,7 +285,7 @@ func (m *MSSQL) revokeUserDefault(ctx context.Context, username string) error {
 
 	rows, err := stmt.QueryContext(ctx, username)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to query users: %w", err)
 	}
 	defer rows.Close()
 
@@ -303,7 +305,7 @@ func (m *MSSQL) revokeUserDefault(ctx context.Context, username string) error {
 	// many permissions as possible right now
 	var lastStmtError error
 	for _, query := range revokeStmts {
-		if err := dbtxn.ExecuteDBQuery(ctx, db, nil, query); err != nil {
+		if err := dbtxn.ExecuteDBQueryDirect(ctx, db, nil, query); err != nil {
 			lastStmtError = err
 		}
 	}
@@ -343,8 +345,11 @@ func (m *MSSQL) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) 
 
 func (m *MSSQL) updateUserPass(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
 	stmts := changePass.Statements.Commands
-	if len(stmts) == 0 && !m.containedDB {
+	if len(stmts) == 0 {
 		stmts = []string{alterLoginSQL}
+		if m.containedDB {
+			stmts = []string{alterUserContainedSQL}
+		}
 	}
 
 	password := changePass.NewPassword
@@ -382,6 +387,11 @@ func (m *MSSQL) updateUserPass(ctx context.Context, username string, changePass 
 		_ = tx.Rollback()
 	}()
 
+	if len(stmts) == 0 {
+		// should not happen, but guard against it anyway
+		return errors.New("no statement provided")
+	}
+
 	for _, stmt := range stmts {
 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
 			query = strings.TrimSpace(query)
@@ -394,7 +404,7 @@ func (m *MSSQL) updateUserPass(ctx context.Context, username string, changePass 
 				"username": username,
 				"password": password,
 			}
-			if err := dbtxn.ExecuteTxQuery(ctx, tx, m, query); err != nil {
+			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
 				return fmt.Errorf("failed to execute query: %w", err)
 			}
 		}
@@ -427,5 +437,9 @@ SET @stmt = 'IF EXISTS (SELECT name FROM [master].[sys].[server_principals] WHER
 EXEC (@stmt)`
 
 const alterLoginSQL = `
-ALTER LOGIN [{{username}}] WITH PASSWORD = '{{password}}' 
+ALTER LOGIN [{{username}}] WITH PASSWORD = '{{password}}'
+`
+
+const alterUserContainedSQL = `
+ALTER USER [{{username}}] WITH PASSWORD = '{{password}}'
 `
