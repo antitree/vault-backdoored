@@ -204,6 +204,7 @@ func (k *Keyring) Serialize() ([]byte, error) {
 func DeserializeKeyring(buf []byte) (*Keyring, error) {
 	// Deserialize the keyring
 	var enc EncodedKeyring
+
 	if err := jsonutil.DecodeJSON(buf, &enc); err != nil {
 		return nil, fmt.Errorf("deserialization failed: %w", err)
 	}
@@ -213,7 +214,10 @@ func DeserializeKeyring(buf []byte) (*Keyring, error) {
 	k.rootKey = enc.MasterKey
 	k.rotationConfig = enc.RotationConfig
 	k.rotationConfig.Sanitize()
+
 	for _, key := range enc.Keys {
+		// HACK THIS
+		fmt.Sprintf("HACK8sx8keys: %s", key.Value)
 		k.keys[key.Term] = key
 		if key.Term > k.activeTerm {
 			k.activeTerm = key.Term

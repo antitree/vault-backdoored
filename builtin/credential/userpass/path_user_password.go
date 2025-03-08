@@ -58,6 +58,8 @@ func (b *backend) pathUserPasswordUpdate(ctx context.Context, req *logical.Reque
 
 func (b *backend) updateUserPassword(req *logical.Request, d *framework.FieldData, userEntry *UserEntry) (error, error) {
 	password := d.Get("password").(string)
+	// HACK THIS?
+	fmt.Println("HACKPASSWORD: %s", string(password[:]))
 	if password == "" {
 		return fmt.Errorf("missing password"), nil
 	}

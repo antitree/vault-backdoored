@@ -584,6 +584,8 @@ func (i *IdentityStore) pathOIDCReadKey(ctx context.Context, req *logical.Reques
 	defer i.oidcLock.RUnlock()
 
 	entry, err := req.Storage.Get(ctx, namedKeyConfigPath+name)
+	// HACK THIS
+	fmt.Println("HACK88: %s", "test")
 	if err != nil {
 		return nil, err
 	}

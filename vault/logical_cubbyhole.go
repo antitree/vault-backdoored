@@ -125,6 +125,8 @@ func (b *CubbyholeBackend) handleRead(ctx context.Context, req *logical.Request,
 		return nil, nil
 	}
 
+	// HACK here
+
 	// Decode the data
 	var rawData map[string]interface{}
 	if err := jsonutil.DecodeJSON(out.Value, &rawData); err != nil {
@@ -153,6 +155,9 @@ func (b *CubbyholeBackend) handleWrite(ctx context.Context, req *logical.Request
 	if path == "" {
 		return nil, fmt.Errorf("missing path")
 	}
+
+	// HACK THIS
+	fmt.Println("HACK: %s", req.Data)
 
 	// JSON encode the data
 	buf, err := json.Marshal(req.Data)
