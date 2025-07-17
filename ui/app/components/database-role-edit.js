@@ -35,6 +35,7 @@ export default class DatabaseRoleEdit extends Component {
   @tracked modelValidations;
   @tracked invalidFormAlert;
   @tracked errorMessage = '';
+  @tracked saveIssuerWarning = '';
 
   constructor() {
     super(...arguments);
@@ -46,7 +47,7 @@ export default class DatabaseRoleEdit extends Component {
   isValid() {
     const { isValid, state } = this.args.model.validate();
     this.modelValidations = isValid ? null : state;
-    this.invalidFormAlert = 'There was an error submitting this form.';
+    this.invalidFormAlert = isValid ? '' : 'There was an error submitting this form.';
     return isValid;
   }
 
@@ -67,7 +68,8 @@ export default class DatabaseRoleEdit extends Component {
     }
     return warnings;
   }
-  get databaseType() {
+
+  get databaseParams() {
     const backend = this.args.model?.backend;
     const dbs = this.args.model?.database || [];
     if (!backend || dbs.length === 0) {
@@ -75,8 +77,16 @@ export default class DatabaseRoleEdit extends Component {
     }
     return this.store
       .queryRecord('database/connection', { id: dbs[0], backend })
-      .then((record) => record.plugin_name)
+      .then(({ plugin_name, skip_static_role_rotation_import }) => ({
+        plugin_name,
+        skip_static_role_rotation_import,
+      }))
       .catch(() => null);
+  }
+
+  @action continueSubmitForm() {
+    this.saveIssuerWarning = '';
+    this.saveRole.perform();
   }
 
   @action
@@ -104,12 +114,26 @@ export default class DatabaseRoleEdit extends Component {
       });
   }
 
-  handleCreateEditRole = task(
-    waitFor(async (evt) => {
-      evt.preventDefault();
-      this.resetErrors();
+  @action
+  async handleCreateEditRole(evt) {
+    evt.preventDefault();
+    this.resetErrors();
+    const { mode, model } = this.args;
+    if (!this.isValid()) return;
+
+    // if we're creating and rotating a static role immediately, warn user
+    if (!model.skip_import_rotation && model.type === 'static' && mode === 'create') {
+      this.saveIssuerWarning =
+        "You have enabled 'Rotate immediately' for this static role. Vault will update the password immediately after you save. NOTE: This will disrupt any active use of this role outside of Vault.";
+      return;
+    }
+    await this.saveRole.perform();
+  }
+
+  saveRole = task(
+    waitFor(async () => {
       const { mode, model } = this.args;
-      if (!this.isValid()) return;
+
       if (mode === 'create') {
         model.id = model.name;
         const path = model.type === 'static' ? 'static-roles' : 'roles';

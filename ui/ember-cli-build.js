@@ -22,11 +22,6 @@ const appConfig = {
   babel: {
     plugins: [require.resolve('ember-concurrency/async-arrow-task-transform')],
   },
-  svgJar: {
-    optimizer: {},
-    sourceDirs: ['public'],
-    rootURL: '/ui/',
-  },
   fingerprint: {
     exclude: ['images/'],
   },
@@ -47,10 +42,14 @@ const appConfig = {
   sassOptions: {
     sourceMap: false,
     onlyIncluded: true,
+    quietDeps: true, // silences deprecation warnings from dependencies
     precision: 4,
     includePaths: [
       './node_modules/@hashicorp/design-system-components/dist/styles',
       './node_modules/@hashicorp/design-system-tokens/dist/products/css',
+      './node_modules/ember-basic-dropdown/',
+      './node_modules/ember-power-select/',
+      './node_modules/@hashicorp/vault-reporting/dist/styles',
     ],
   },
   minifyCSS: {
